@@ -5,12 +5,19 @@
 #include "esp_log.h"
 
 #define LOCK_PIN GPIO_NUM_2
-static const char *TAG = "lock_test";
 
-void app_main(void) {
-    ESP_LOGI(TAG, "Lock control test starting");
-    
-    // Configure GPIO 2 as output
+// Active-LOW relay logic baked in here.
+// When we move from on-board LED (active-HIGH) to relay (active-LOW),
+// we just flip the LEVEL_LOCKED / LEVEL_UNLOCKED defines below.
+#define LEVEL_LOCKED   0   // For on-board LED test: 0 = LED off = "locked"
+#define LEVEL_UNLOCKED 1   // For on-board LED test: 1 = LED on = "unlocked"
+// When we wire the relay, change to:
+//   #define LEVEL_LOCKED   1   // active-LOW relay: HIGH = relay open = lock stays locked
+//   #define LEVEL_UNLOCKED 0   // active-LOW relay: LOW = relay closed = solenoid fires
+
+static const char *TAG = "lock";
+
+void lock_init(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << LOCK_PIN),
         .mode = GPIO_MODE_OUTPUT,
@@ -19,14 +26,29 @@ void app_main(void) {
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
+    gpio_set_level(LOCK_PIN, LEVEL_LOCKED);  // start in locked state
+    ESP_LOGI(TAG, "Lock initialized in LOCKED state");
+}
+
+void lock_unlock(void) {
+    gpio_set_level(LOCK_PIN, LEVEL_UNLOCKED);
+    ESP_LOGI(TAG, ">>> UNLOCKED");
+}
+
+void lock_lock(void) {
+    gpio_set_level(LOCK_PIN, LEVEL_LOCKED);
+    ESP_LOGI(TAG, ">>> LOCKED");
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "Smart lock booting...");
+    lock_init();
     
+    // Test cycle: unlock for 3 seconds, lock for 3 seconds, repeat
     while (1) {
-        ESP_LOGI(TAG, "Pin HIGH (LED on / relay would energize if active-HIGH)");
-        gpio_set_level(LOCK_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        
-        ESP_LOGI(TAG, "Pin LOW (LED off / relay would energize if active-LOW)");
-        gpio_set_level(LOCK_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        lock_unlock();
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        lock_lock();
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
