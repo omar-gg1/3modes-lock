@@ -5,6 +5,9 @@
 #include "esp_log.h"
 
 #define RELAY_PIN GPIO_NUM_21
+// GPIO 21 is a plain general-purpose pin, no strapping conflicts,
+//    no internal peripheral routing on this board
+
 static const char *TAG = "relay_test";
 
 void app_main(void) {
