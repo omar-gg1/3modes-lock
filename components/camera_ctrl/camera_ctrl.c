@@ -44,10 +44,10 @@ esp_err_t camera_ctrl_init(void) {
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size = FRAMESIZE_QVGA,    // 320x240 — fast streaming
-        .jpeg_quality = 12,
-        .fb_count = 2,
+        .jpeg_quality = 15,
+        .fb_count = 3,
         .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+        .grab_mode = CAMERA_GRAB_LATEST,
     };
 
     esp_err_t err = esp_camera_init(&config);
