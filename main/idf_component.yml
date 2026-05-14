@@ -17,3 +17,4 @@ dependencies:
   espressif/esp32-camera: ^2.0.13
   espressif/esp-dl: '*'
   espressif/human_face_detect: '*'
+  espressif/human_face_recognition: "^0.3.2"
