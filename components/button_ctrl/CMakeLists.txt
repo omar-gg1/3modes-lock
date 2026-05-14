@@ -1,3 +1,3 @@
 idf_component_register(SRCS "button_ctrl.c"
                        INCLUDE_DIRS "include"
-                       REQUIRES driver log)
+                       REQUIRES driver log esp_timer)
