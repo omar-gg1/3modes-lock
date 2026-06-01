@@ -1,0 +1,11 @@
+Stack lockdown (decided 15 May 2026):
+- Backend: Python + FastAPI + SQLAlchemy
+- Broker: Mosquitto in Docker
+- DB: SQLite local → Postgres on Railway prod
+- ML: face_recognition (dlib-based) for Mode 3 ML verification
+- App: React Native + TypeScript (after backend)
+- Transport: MQTT for live events, REST for queries
+- Hosting: localhost for dev, Railway for staging/demo
+Rationale: face_recognition lib has no JS equivalent at same accuracy.
+FastAPI auto-generates OpenAPI → openapi-typescript regenerates RN types.
+Best of both worlds without forced JS-everywhere.
