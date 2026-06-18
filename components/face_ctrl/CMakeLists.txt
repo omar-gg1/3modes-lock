@@ -7,6 +7,7 @@ idf_component_register(
         esp-dl
         human_face_detect
         human_face_recognition
+        crypto_ctrl
         spiffs
         log
         esp_psram

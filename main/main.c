@@ -11,6 +11,7 @@
 #include "keypad_ctrl.h"
 #include "wifi_ctrl.h"
 #include "debug_server.h"
+#include "crypto_ctrl.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
 #define FACE_MATCH_THRESHOLD 0.6f
@@ -37,6 +38,9 @@ void app_main(void) {
     ESP_LOGI(TAG, "==== Smart Lock booting ====");
 
     nvs_init_safe();
+    // crypto_ctrl must come up before face_ctrl: face_ctrl_init() decrypts the
+    // face database on mount, which needs the AES key loaded/created first.
+    ESP_ERROR_CHECK(crypto_ctrl_init());
     lock_ctrl_init();
     button_ctrl_init();
     keypad_ctrl_init();

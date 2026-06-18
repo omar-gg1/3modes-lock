@@ -14,6 +14,7 @@
 #include "human_face_recognition.hpp"
 #include "dl_image_define.hpp"
 #include "esp_spiffs.h"
+#include "crypto_ctrl.h"
 
 static const char *TAG = "face_ctrl";
 
@@ -31,10 +32,31 @@ static const int FRAME_W = 320;
 static const int FRAME_H = 240;
 static const size_t RGB_BUF_SIZE = FRAME_W * FRAME_H * 3;
 
-// Path where the recognizer persists enrolled face features.
-// Stored as a file in the spiffs "models" partition we already have.
-// HumanFaceRecognizer handles the file format internally.
-static const char *RECOGNIZER_DB_PATH = "/spiffs/faces.db";
+// The recognizer reads/writes a plaintext working file (it does raw fopen/fread
+// and has no encryption hook). We keep that working file as the in-use DB, and
+// keep the *encrypted* copy as the at-rest artifact:
+//
+//   RECOGNIZER_DB_PATH      <- plaintext, what HumanFaceRecognizer opens
+//   RECOGNIZER_DB_ENC_PATH  <- AES-256-GCM ciphertext, what survives at rest
+//
+// On init we decrypt .enc -> plaintext; after each enroll we re-encrypt
+// plaintext -> .enc. See crypto_ctrl.h for the container format. The brief
+// existence of the plaintext working file is the documented tradeoff of doing
+// this above esp-dl; the eFuse/flash-encryption hardening stage covers it.
+static const char *RECOGNIZER_DB_PATH     = "/spiffs/faces.db";
+static const char *RECOGNIZER_DB_ENC_PATH = "/spiffs/faces.db.enc";
+
+// Re-encrypt the plaintext working DB back to the at-rest ciphertext. Called
+// after any operation that mutates the DB (enroll). Logs but does not abort the
+// caller on failure — the in-memory/plaintext state is still valid for this
+// session; we just failed to persist the encrypted copy.
+static void persist_encrypted_db(void)
+{
+    esp_err_t err = crypto_ctrl_encrypt_file(RECOGNIZER_DB_PATH, RECOGNIZER_DB_ENC_PATH);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to re-encrypt face DB: %s", esp_err_to_name(err));
+    }
+}
 
 // Mount the "models" SPIFFS partition at /spiffs.
 // HumanFaceRecognizer will create its database file at /spiffs/faces.db.
@@ -79,6 +101,27 @@ extern "C" esp_err_t face_ctrl_init(void)
     // Mount SPIFFS before HumanFaceRecognizer tries to open its db file.
     if (mount_spiffs() != ESP_OK) {
         return ESP_FAIL;
+    }
+
+    // Restore the plaintext working DB from the encrypted copy at rest, so the
+    // recognizer (which only understands a plaintext file) has something to open.
+    //   - ESP_OK              : decrypted an existing DB, ready to use.
+    //   - ESP_ERR_NOT_FOUND   : no encrypted DB yet (first ever boot) — fine,
+    //                           the recognizer will create an empty one.
+    //   - ESP_ERR_INVALID_CRC : the encrypted DB failed authentication (tampered
+    //                           or key changed). We refuse to fall back to a
+    //                           stale plaintext file: delete it so the recognizer
+    //                           starts clean rather than trusting unverified data.
+    esp_err_t dec = crypto_ctrl_decrypt_file(RECOGNIZER_DB_ENC_PATH, RECOGNIZER_DB_PATH);
+    if (dec == ESP_OK) {
+        ESP_LOGI(TAG, "face DB decrypted from %s", RECOGNIZER_DB_ENC_PATH);
+    } else if (dec == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "no encrypted face DB yet — starting fresh");
+        remove(RECOGNIZER_DB_PATH);  // ensure no stale plaintext lingers
+    } else {
+        ESP_LOGE(TAG, "face DB failed authentication (%s) — discarding",
+                 esp_err_to_name(dec));
+        remove(RECOGNIZER_DB_PATH);
     }
 
     s_rgb_buf = (uint8_t *) jpeg_calloc_align(RGB_BUF_SIZE, 16);
@@ -231,8 +274,13 @@ extern "C" esp_err_t face_ctrl_enroll(int id)
 
     dl::image::img_t img = build_img();
     // enroll() takes the image and detection results.
-    // It internally extracts features and stores them with the given id.
+    // It internally extracts features and writes them to the plaintext working
+    // DB at RECOGNIZER_DB_PATH.
     s_recognizer->enroll(img, s_last_results);
+
+    // The plaintext DB just changed on flash — refresh the encrypted copy so the
+    // at-rest artifact stays in sync and survives the next reboot.
+    persist_encrypted_db();
 
     ESP_LOGI(TAG, "enrolled face as id=%d", id);
     return ESP_OK;
