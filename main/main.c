@@ -17,16 +17,17 @@
 #define ENROLLMENT_TIMEOUT_MS 10000
 #define FACE_MATCH_THRESHOLD 0.6f
 
-// Master switch for the liveness challenge. 1 = require a head-turn after a face
-// match before unlocking (anti-photo-spoof). 0 = face match alone unlocks
-// (snappy daily use; flip to 1 for the anti-spoof demo). Kept ON now that the
-// check is patient + cumulative, with this as an escape hatch.
+// Master switch for the liveness challenge. 1 = require a brief frontal-motion
+// challenge after a face match before unlocking (anti-photo-spoof). 0 = face
+// match alone unlocks (snappy daily use; flip to 1 for the anti-spoof demo).
+// Kept ON now that the challenge keeps the face frontal so the detector no
+// longer loses it (the head-turn version did), with this as an escape hatch.
 #define LIVENESS_ENABLED   1
 
-// After a face matches, the user has this long to complete the head-turn before
-// the attempt is abandoned. Widened to 12s: detections are sparse (~1/s), so the
-// pose change needs time to accumulate across frames. The liveness check passes
-// as soon as the turn is detected, so a quick turn unlocks well before this.
+// After a face matches, the user has this long to complete the frontal-motion
+// challenge before the attempt is abandoned. The face stays frontal so detection
+// is dense now (~10-20 frames/s), and the check passes as soon as enough natural
+// micro-motion accumulates — a small lean/movement unlocks well before this.
 #define LIVENESS_WINDOW_MS 12000
 #define KEYPOINT_BUF_LEN   10
 
@@ -255,7 +256,7 @@ void app_main(void) {
                     if (similarity > FACE_MATCH_THRESHOLD) {
                         if (LIVENESS_ENABLED) {
                             // Hand off to the liveness challenge (recognition stops).
-                            ESP_LOGI(TAG, ">>> Face matched (user %d). Liveness: TURN YOUR HEAD",
+                            ESP_LOGI(TAG, ">>> Face matched (user %d). Liveness: LEAN IN / MOVE A LITTLE",
                                      matched_id);
                             liveness_ctrl_begin();
                             liveness_started_at_us = esp_timer_get_time();

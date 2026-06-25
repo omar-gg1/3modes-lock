@@ -10,30 +10,42 @@ static const char *TAG = "liveness_ctrl";
 // These are starting points. Like the recognition threshold, they MUST be tuned
 // against real data: too strict and legitimate users get locked out; too loose
 // and a photo passes. Record the tuning in the thesis test section.
+//
+// DESIGN NOTE — why this is a "frontal micro-motion" challenge, not "head-turn".
+// The original design asked the user to TURN THEIR HEAD and looked for a large
+// nose-vs-eyes pose swing. Hardware testing proved this is self-defeating: the
+// ESP-WHO 5-keypoint detector is trained on near-FRONTAL faces, so the instant
+// the head turns far enough to register, the detector LOSES the face and emits
+// no keypoints. Result: the liveness check was fed ~0 frames out of ~93 and
+// always timed out (logged as no_face=93). The fix is to keep the user roughly
+// frontal — prompt "lean in / move a little" — and detect liveness from the
+// internal MICRO-MOTION of the facial keypoints, which the detector CAN see
+// because the face never leaves frontal. A flat printed photo held to the camera
+// cannot reproduce this internal, non-rigid jitter.
 
-// Max frames to gather before giving up on the pose challenge. Detections are
-// sparse (~1/s), so a 12s window only yields ~10 frames — cap is generous.
-#define LIVENESS_MAX_FRAMES        30
+// Max frames to gather before giving up on the challenge. Detections during the
+// frontal-motion challenge are now dense (~10-20/s) because the face stays in
+// view, so this cap is reached quickly under normal use.
+#define LIVENESS_MAX_FRAMES        60
 
-// Min frames before any verdict, so a single frame can't pass/fail. Lowered to 3
-// because detections are sparse — demanding more just rejects real users who
-// were already recognized. The pose-RANGE requirement still proves real motion.
-#define LIVENESS_MIN_FRAMES        3
+// Min frames before any verdict, so a single noisy frame can't pass or fail.
+#define LIVENESS_MIN_FRAMES        6
 
-// Pose challenge: nose horizontal offset from the eye-midpoint, normalized by
-// inter-eye distance. ~0 facing dead-on; grows as the head turns. We accumulate
-// the min and max across the WHOLE window (frames need not be consecutive) and
-// pass once their spread exceeds this — i.e. the head turned far enough at some
-// point during the window. Lowered 0.18 -> 0.12: real turns measured 0.18-0.27,
-// so 0.12 leaves comfortable margin for the user while a flat photo (which can't
-// move the nose relative to the eyes) still won't reach it.
-#define POSE_OFFSET_RANGE_MIN      0.12f
+// Pose wobble: nose horizontal offset from the eye-midpoint, normalized by
+// inter-eye distance. Staying frontal this stays small, but natural movement
+// (a slight lean, a small nod) still wobbles it a little. This is now only a
+// CORROBORATING signal with a SMALL threshold — we are NOT asking for a big
+// turn anymore (that broke detection). A rigid photo produces ~0 wobble.
+#define POSE_OFFSET_RANGE_MIN      0.020f
 
-// Micro-motion: average per-frame nose movement (px). Below MIN = suspiciously
-// rigid (held photo). The MAX guard is generous so natural movement isn't
-// distrusted. NOTE: a PASS now needs the pose-turn OR enough motion — see below.
-#define MOTION_PIXELS_MIN          0.8f
-#define MOTION_PIXELS_MAX          60.0f
+// Micro-motion is now the PRIMARY liveness signal: average per-frame nose
+// movement in pixels. A live frontal face is never perfectly still — keypoints
+// jitter from breathing, micro head-sway, and detector noise on real skin. A
+// printed photo held up is far more rigid. Below MIN = suspiciously rigid.
+// The MAX guard rejects implausibly large jumps (e.g. detector flicking between
+// two faces / a video being waved around), which are not natural frontal motion.
+#define MOTION_PIXELS_MIN          1.2f
+#define MOTION_PIXELS_MAX          40.0f
 
 // Keypoint index layout (ESP-WHO 5-point order), in ints:
 //   [0,1] left eye   [2,3] right eye   [4,5] nose   [6,7] mouthL   [8,9] mouthR
@@ -141,34 +153,40 @@ liveness_result_t liveness_ctrl_feed(const int *keypoints, int count)
                        ? (s.motion_accum / (float) s.motion_samples)
                        : 0.0f;
 
-    // Progress feedback every frame so the user/dev SEES it accumulating toward
-    // the target instead of a silent pass/fail. "turn your head" becomes visible.
-    ESP_LOGI(TAG, "liveness... pose=%.3f/%.2f motion=%.1fpx frames=%d",
-             pose_range, POSE_OFFSET_RANGE_MIN, avg_motion, s.frames);
+    // Progress feedback every frame so the user/dev SEES the motion accumulating
+    // toward the target instead of a silent pass/fail. Motion is the primary
+    // signal now, so show it against its threshold; pose wobble is secondary.
+    ESP_LOGI(TAG, "liveness... motion=%.1f/%.1fpx pose_wobble=%.3f/%.3f frames=%d",
+             avg_motion, MOTION_PIXELS_MIN, pose_range, POSE_OFFSET_RANGE_MIN,
+             s.frames);
 
     // Need a minimum number of frames before any verdict.
     if (s.frames < LIVENESS_MIN_FRAMES) {
         return LIVENESS_PENDING;
     }
 
-    // ---- PASS: the head turned far enough at some point in the window. ----
-    // This is the PRIMARY signal and the one a flat photo cannot fake (turning
-    // the head moves the nose relative to the eye-line). We accept on the pose
-    // turn alone — natural motion always accompanies a real turn anyway.
-    if (pose_range >= POSE_OFFSET_RANGE_MIN && avg_motion <= MOTION_PIXELS_MAX) {
-        ESP_LOGI(TAG, "PASS: pose_range=%.3f motion=%.2fpx frames=%d",
-                 pose_range, avg_motion, s.frames);
+    // ---- PASS: live frontal face showing natural internal micro-motion. ----
+    // PRIMARY signal: the keypoints jitter within the natural range (not too
+    // rigid, not implausibly large), AND there is at least a small pose wobble.
+    // A live face staying frontal trips both; a rigid printed photo trips
+    // neither (no internal motion, no nose-vs-eye wobble). We require enough
+    // frames first so a couple of noisy frames can't pass on their own.
+    if (s.frames >= LIVENESS_MIN_FRAMES &&
+        avg_motion >= MOTION_PIXELS_MIN && avg_motion <= MOTION_PIXELS_MAX &&
+        pose_range >= POSE_OFFSET_RANGE_MIN) {
+        ESP_LOGI(TAG, "PASS: motion=%.2fpx (>=%.2f) pose_wobble=%.3f frames=%d",
+                 avg_motion, MOTION_PIXELS_MIN, pose_range, s.frames);
         return LIVENESS_PASS;
     }
 
     // ---- Static-image rejection ----
     // Only conclude "photo" if, after enough frames, the geometry is BOTH rigid
-    // (near-zero motion) AND showed no pose change at all. This avoids failing a
-    // real person who briefly held still — they'll just stay PENDING and pass
-    // once they turn. A held photo trips both and is rejected.
-    if (s.frames >= LIVENESS_MIN_FRAMES + 2 &&
-        avg_motion < MOTION_PIXELS_MIN && pose_range < 0.03f) {
-        ESP_LOGW(TAG, "FAIL_STATIC: rigid (motion=%.2fpx pose_range=%.3f frames=%d)",
+    // (near-zero internal motion) AND showed essentially no pose wobble. This
+    // avoids failing a real person who briefly held still — they stay PENDING
+    // and pass once they move. A held photo trips both and is rejected early.
+    if (s.frames >= LIVENESS_MIN_FRAMES + 4 &&
+        avg_motion < MOTION_PIXELS_MIN && pose_range < POSE_OFFSET_RANGE_MIN) {
+        ESP_LOGW(TAG, "FAIL_STATIC: rigid (motion=%.2fpx pose_wobble=%.3f frames=%d)",
                  avg_motion, pose_range, s.frames);
         return LIVENESS_FAIL_STATIC;
     }
