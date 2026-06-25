@@ -1,0 +1,44 @@
+# Smart Lock — Mode 2 (Hybrid) backend, dev stack.
+#
+# Two services:
+#   mosquitto : the MQTT broker the ESP32 publishes access events to
+#   api       : FastAPI app — subscribes to those events, stores them in SQLite,
+#               and serves a REST log API for the (future) mobile app.
+#
+# Bring it up with:   docker compose up --build
+# The API is then on  http://localhost:8000  (docs at /docs)
+# The broker is on     localhost:1883
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: smartlock-mosquitto
+    ports:
+      - "1883:1883"      # MQTT — the ESP32 and the api both connect here
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: smartlock-api
+    ports:
+      - "8000:8000"      # FastAPI / REST + OpenAPI docs
+    environment:
+      # The api connects to the broker by its compose service name, not localhost.
+      MQTT_BROKER_HOST: mosquitto
+      MQTT_BROKER_PORT: "1883"
+      MQTT_EVENT_TOPIC: "smartlock/+/events"   # '+' = any device id
+      DATABASE_URL: "sqlite:////data/smartlock.db"
+    volumes:
+      - api_data:/data    # SQLite file lives here, survives restarts
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+volumes:
+  mosquitto_data:
+  api_data:

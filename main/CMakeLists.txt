@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
                        INCLUDE_DIRS "."
-                       REQUIRES lock_ctrl button_ctrl camera_ctrl wifi_ctrl debug_server face_ctrl keypad_ctrl crypto_ctrl nvs_flash)
+                       REQUIRES lock_ctrl button_ctrl camera_ctrl wifi_ctrl debug_server face_ctrl keypad_ctrl crypto_ctrl liveness_ctrl nvs_flash)

@@ -43,9 +43,19 @@ esp_err_t camera_ctrl_init(void) {
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,    // 320x240 — fast streaming
-        .jpeg_quality = 15,
-        .fb_count = 3,
+        .frame_size = FRAMESIZE_QVGA,    // 320x240 — matches the recognizer input
+        // jpeg_quality: LOWER number = BETTER quality (less compression). 10 gives
+        // the recognizer cleaner pixels than the old 15, which raises and steadies
+        // similarity scores. The recognizer is the consumer, not a human eye, so
+        // we trade a little bandwidth for fidelity.
+        .jpeg_quality = 10,
+        // fb_count = 2: double-buffering. With 1 buffer the camera DMA and the
+        // JPEG decoder fight over the same memory — the decoder reads a frame the
+        // camera is mid-writing, giving corrupt JPEGs (NO-SOI / jpeg_dec -3) and
+        // occasional crashes. With 3+ buffers stale frames pile up (FB-OVF). Two
+        // buffers + GRAB_LATEST is the sweet spot: one fills while one is read,
+        // and we always get the freshest completed frame.
+        .fb_count = 2,
         .fb_location = CAMERA_FB_IN_PSRAM,
         .grab_mode = CAMERA_GRAB_LATEST,
     };

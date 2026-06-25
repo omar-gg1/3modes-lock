@@ -5,3 +5,12 @@ dependencies.lock
 .vscode/
 .devcontainer/
 sm-lock-fnl.docx
+
+# backend (Mode 2)
+backend/**/*.db
+backend/**/__pycache__/
+backend/.env
+__pycache__/
+
+# firmware secrets (Wi-Fi / broker config, never commit)
+**/wifi_config.h
