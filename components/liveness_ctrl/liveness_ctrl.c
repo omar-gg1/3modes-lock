@@ -28,8 +28,15 @@ static const char *TAG = "liveness_ctrl";
 // view, so this cap is reached quickly under normal use.
 #define LIVENESS_MAX_FRAMES        60
 
-// Min frames before any verdict, so a single noisy frame can't pass or fail.
-#define LIVENESS_MIN_FRAMES        6
+// Min good frames before any verdict, so a single noisy frame can't pass or
+// fail. Lowered 6 -> 4 from hardware data: detection is slow and many frames
+// come back no-face (corrupt JPEG / FB-OVF), so a 12s window only harvests
+// ~3-6 GOOD frames. Requiring 6 starved ~half of all live attempts (they died
+// at frames=3). 4 still demands sustained motion across multiple frames (a lone
+// noise spike can't pass) but fits the real good-frame budget. The motion and
+// pose thresholds are unchanged — live motion clears them by a wide margin, so
+// they are not the bottleneck; the frame SUPPLY was.
+#define LIVENESS_MIN_FRAMES        4
 
 // Pose wobble: nose horizontal offset from the eye-midpoint, normalized by
 // inter-eye distance. Staying frontal this stays small, but natural movement
