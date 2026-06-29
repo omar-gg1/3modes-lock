@@ -38,19 +38,35 @@ static const char *TAG = "liveness_ctrl";
 // they are not the bottleneck; the frame SUPPLY was.
 #define LIVENESS_MIN_FRAMES        4
 
-// Pose wobble: nose horizontal offset from the eye-midpoint, normalized by
-// inter-eye distance. Staying frontal this stays small, but natural movement
-// (a slight lean, a small nod) still wobbles it a little. This is now only a
-// CORROBORATING signal with a SMALL threshold — we are NOT asking for a big
-// turn anymore (that broke detection). A rigid photo produces ~0 wobble.
-#define POSE_OFFSET_RANGE_MIN      0.020f
+// ---- THE ANTI-SPOOF SIGNAL: non-rigid deformation (rigid-vs-3D) ----
+//
+// WHY motion alone failed: a hand-held photo HAS micro-motion (a trembling hand
+// jitters the keypoints just like a live face), so "average nose movement" can
+// NOT separate a live face from a shaken photo. Hardware proof: a phone photo
+// unlocked the lock because the user's hand-shake fed the motion signal.
+//
+// THE PHYSICS WE EXPLOIT INSTEAD: a photo is a RIGID PLANE. However you shake or
+// tilt it, all keypoints translate/scale/rotate TOGETHER — the geometry BETWEEN
+// them stays fixed. A real face is a NON-RIGID 3D object: the nose protrudes
+// toward the camera, so the smallest movement causes PARALLAX — the nose's
+// projected position shifts relative to the eyes/mouth behind it. So we measure
+// shape descriptors that are INVARIANT to translation, scale and in-plane
+// rotation, and watch whether they DEFORM:
+//   r_along = nose's position along the eye-line, as a fraction between the eyes
+//   r_perp  = nose's perpendicular distance from the eye-line / inter-eye dist
+// Both are pure shape ratios. A rigid photo (even violently shaken) keeps them
+// near-constant; a live 3D face wobbles them. We track the RANGE (max-min) of
+// each across the window; their sum is the non-rigidity score. THIS is the
+// signal a shaking photo cannot fake.
+//
+// CALIBRATE these against real live-vs-photo numbers printed in the serial log.
+// Starting points; the live face should clear them, a (shaken) photo should not.
+#define SHAPE_DEFORM_MIN           0.060f
 
-// Micro-motion is now the PRIMARY liveness signal: average per-frame nose
-// movement in pixels. A live frontal face is never perfectly still — keypoints
-// jitter from breathing, micro head-sway, and detector noise on real skin. A
-// printed photo held up is far more rigid. Below MIN = suspiciously rigid.
-// The MAX guard rejects implausibly large jumps (e.g. detector flicking between
-// two faces / a video being waved around), which are not natural frontal motion.
+// Micro-motion is now only a SANITY GATE, not the liveness proof. We still want
+// SOME motion (a perfectly frozen frame stream is suspicious / the user walked
+// off) and reject absurd jumps, but motion magnitude no longer grants a PASS on
+// its own — only non-rigid DEFORMATION does. This is the whole fix.
 #define MOTION_PIXELS_MIN          1.2f
 #define MOTION_PIXELS_MAX          40.0f
 
@@ -67,8 +83,10 @@ static const char *TAG = "liveness_ctrl";
 // ---- Accumulated state for the current attempt ----
 typedef struct {
     int   frames;                 // frames fed so far
-    float pose_min;               // min normalized nose offset seen
-    float pose_max;               // max normalized nose offset seen
+    // Non-rigidity tracking: range of the two invariant shape ratios.
+    float along_min, along_max;   // nose position ALONG the eye-line (fraction)
+    float perp_min,  perp_max;    // nose distance PERP to the eye-line (norm.)
+    // Micro-motion (sanity gate only).
     float motion_accum;           // sum of per-frame nose movement (pixels)
     int   motion_samples;         // number of movements summed
     bool  have_prev_nose;
@@ -81,8 +99,8 @@ static liveness_state_t s;
 void liveness_ctrl_begin(void)
 {
     s.frames = 0;
-    s.pose_min = 1e9f;
-    s.pose_max = -1e9f;
+    s.along_min = 1e9f;  s.along_max = -1e9f;
+    s.perp_min  = 1e9f;  s.perp_max  = -1e9f;
     s.motion_accum = 0.0f;
     s.motion_samples = 0;
     s.have_prev_nose = false;
@@ -96,12 +114,20 @@ bool liveness_ctrl_is_timed_out(void)
     return s.frames >= LIVENESS_MAX_FRAMES;
 }
 
-// Compute the normalized nose-vs-eyes horizontal offset for one frame.
-//   offset = (nose_x - eye_midpoint_x) / inter_eye_distance
-// Normalizing by inter-eye distance makes it scale-invariant (works whether the
-// face is near or far). Returns false if the geometry is degenerate.
-static bool compute_pose_offset(const int *kp, float *out_offset,
-                                float *out_nose_x, float *out_nose_y)
+// Compute two SHAPE ratios for the nose relative to the eye-line, both invariant
+// to translation, scale and in-plane rotation — so a rigid photo that is shaken,
+// moved or tilted produces near-CONSTANT values, while a live 3D face deforms
+// them via parallax. We express the nose in the coordinate frame of the eye
+// vector (L_eye -> R_eye):
+//   r_along = projection of (nose - L_eye) onto the unit eye vector, / inter_eye
+//             => where the nose sits BETWEEN the eyes (0 at L, 1 at R), fractional
+//   r_perp  = perpendicular distance of the nose from the eye-line, / inter_eye
+//             => how far the nose is OFF the eye-line (depth/tilt cue)
+// Dividing by inter_eye makes both scale-free; projecting onto the eye vector
+// makes both rotation-free; using differences makes both translation-free.
+// Returns false if the geometry is degenerate (eyes coincident).
+static bool compute_shape_ratios(const int *kp, float *out_along, float *out_perp,
+                                 float *out_nose_x, float *out_nose_y)
 {
     float lx = (float) kp[KP_LEFT_EYE_X];
     float ly = (float) kp[KP_LEFT_EYE_Y];
@@ -110,17 +136,25 @@ static bool compute_pose_offset(const int *kp, float *out_offset,
     float nx = (float) kp[KP_NOSE_X];
     float ny = (float) kp[KP_NOSE_Y];
 
-    float eye_mid_x = (lx + rx) * 0.5f;
-    float dx = rx - lx;
-    float dy = ry - ly;
-    float inter_eye = sqrtf(dx * dx + dy * dy);
-
+    float ex = rx - lx;            // eye vector (L -> R)
+    float ey = ry - ly;
+    float inter_eye = sqrtf(ex * ex + ey * ey);
     if (inter_eye < 1.0f) {
         // Eyes on top of each other — bad/degenerate detection, skip.
         return false;
     }
 
-    *out_offset = (nx - eye_mid_x) / inter_eye;
+    // Unit eye vector and its perpendicular.
+    float ux = ex / inter_eye, uy = ey / inter_eye;
+    // Nose relative to the left eye.
+    float vx = nx - lx, vy = ny - ly;
+
+    // Projection along the eye vector (signed), and perpendicular component.
+    float along = (vx * ux + vy * uy) / inter_eye;   // fraction between eyes
+    float perp  = (vx * uy - vy * ux) / inter_eye;   // signed perp distance
+
+    *out_along = along;
+    *out_perp  = perp;
     *out_nose_x = nx;
     *out_nose_y = ny;
     return true;
@@ -133,18 +167,23 @@ liveness_result_t liveness_ctrl_feed(const int *keypoints, int count)
         return LIVENESS_PENDING;
     }
 
-    float offset, nose_x, nose_y;
-    if (!compute_pose_offset(keypoints, &offset, &nose_x, &nose_y)) {
+    float along, perp, nose_x, nose_y;
+    if (!compute_shape_ratios(keypoints, &along, &perp, &nose_x, &nose_y)) {
         return LIVENESS_PENDING;
     }
 
     s.frames++;
 
-    // Track the range of the pose offset (how far the head turned).
-    if (offset < s.pose_min) s.pose_min = offset;
-    if (offset > s.pose_max) s.pose_max = offset;
+    // Track the RANGE of each invariant shape ratio — this is the non-rigidity
+    // signal. A rigid photo (even shaken/tilted) keeps these ratios constant, so
+    // their range stays ~0; a live 3D face deforms them via parallax.
+    if (along < s.along_min) s.along_min = along;
+    if (along > s.along_max) s.along_max = along;
+    if (perp  < s.perp_min)  s.perp_min  = perp;
+    if (perp  > s.perp_max)  s.perp_max  = perp;
 
-    // Track per-frame nose movement for the micro-motion signal.
+    // Track per-frame nose movement — now only a sanity gate (some motion must
+    // exist; absurd jumps rejected), NOT proof of liveness on its own.
     if (s.have_prev_nose) {
         float mdx = nose_x - s.prev_nose_x;
         float mdy = nose_y - s.prev_nose_y;
@@ -155,16 +194,19 @@ liveness_result_t liveness_ctrl_feed(const int *keypoints, int count)
     s.prev_nose_y = nose_y;
     s.have_prev_nose = true;
 
-    float pose_range = s.pose_max - s.pose_min;
+    float along_range = s.along_max - s.along_min;
+    float perp_range  = s.perp_max  - s.perp_min;
+    // Non-rigidity score: total deformation of the nose's shape relative to the
+    // eye-line. Rigid translation/scale/rotation of a photo cannot raise this.
+    float shape_deform = along_range + perp_range;
     float avg_motion = (s.motion_samples > 0)
                        ? (s.motion_accum / (float) s.motion_samples)
                        : 0.0f;
 
-    // Progress feedback every frame so the user/dev SEES the motion accumulating
-    // toward the target instead of a silent pass/fail. Motion is the primary
-    // signal now, so show it against its threshold; pose wobble is secondary.
-    ESP_LOGI(TAG, "liveness... motion=%.1f/%.1fpx pose_wobble=%.3f/%.3f frames=%d",
-             avg_motion, MOTION_PIXELS_MIN, pose_range, POSE_OFFSET_RANGE_MIN,
+    // Progress feedback every frame. shape_deform is THE liveness signal now;
+    // motion is shown only as the sanity gate it has become.
+    ESP_LOGI(TAG, "liveness... deform=%.3f/%.3f motion=%.1f/%.1fpx frames=%d",
+             shape_deform, SHAPE_DEFORM_MIN, avg_motion, MOTION_PIXELS_MIN,
              s.frames);
 
     // Need a minimum number of frames before any verdict.
@@ -172,36 +214,33 @@ liveness_result_t liveness_ctrl_feed(const int *keypoints, int count)
         return LIVENESS_PENDING;
     }
 
-    // ---- PASS: live frontal face showing natural internal micro-motion. ----
-    // PRIMARY signal: the keypoints jitter within the natural range (not too
-    // rigid, not implausibly large), AND there is at least a small pose wobble.
-    // A live face staying frontal trips both; a rigid printed photo trips
-    // neither (no internal motion, no nose-vs-eye wobble). We require enough
-    // frames first so a couple of noisy frames can't pass on their own.
-    if (s.frames >= LIVENESS_MIN_FRAMES &&
-        avg_motion >= MOTION_PIXELS_MIN && avg_motion <= MOTION_PIXELS_MAX &&
-        pose_range >= POSE_OFFSET_RANGE_MIN) {
-        ESP_LOGI(TAG, "PASS: motion=%.2fpx (>=%.2f) pose_wobble=%.3f frames=%d",
-                 avg_motion, MOTION_PIXELS_MIN, pose_range, s.frames);
+    // ---- PASS: live 3D face shown by NON-RIGID deformation. ----
+    // The nose's shape ratios deformed past the threshold (parallax from a real
+    // 3D face) AND there is plausible motion (sanity gate). A shaken photo can
+    // satisfy the motion gate but CANNOT deform the rigid shape — so it fails
+    // here. This is the fix for the photo-unlock bug.
+    if (shape_deform >= SHAPE_DEFORM_MIN &&
+        avg_motion >= MOTION_PIXELS_MIN && avg_motion <= MOTION_PIXELS_MAX) {
+        ESP_LOGI(TAG, "PASS: deform=%.3f (>=%.3f) motion=%.2fpx frames=%d",
+                 shape_deform, SHAPE_DEFORM_MIN, avg_motion, s.frames);
         return LIVENESS_PASS;
     }
 
-    // ---- Static-image rejection ----
-    // Only conclude "photo" if, after enough frames, the geometry is BOTH rigid
-    // (near-zero internal motion) AND showed essentially no pose wobble. This
-    // avoids failing a real person who briefly held still — they stay PENDING
-    // and pass once they move. A held photo trips both and is rejected early.
-    if (s.frames >= LIVENESS_MIN_FRAMES + 4 &&
-        avg_motion < MOTION_PIXELS_MIN && pose_range < POSE_OFFSET_RANGE_MIN) {
-        ESP_LOGW(TAG, "FAIL_STATIC: rigid (motion=%.2fpx pose_wobble=%.3f frames=%d)",
-                 avg_motion, pose_range, s.frames);
+    // ---- Static / rigid-spoof rejection ----
+    // After enough frames, if the shape never deformed past the threshold it is
+    // a rigid plane (a photo) regardless of how much it moved. We reject on
+    // RIGIDITY, not on stillness — this is what catches a SHAKEN photo (high
+    // motion, ~zero deformation) that the old motion-only check let through.
+    if (s.frames >= LIVENESS_MIN_FRAMES + 4 && shape_deform < SHAPE_DEFORM_MIN) {
+        ESP_LOGW(TAG, "FAIL_STATIC: rigid (deform=%.3f<%.3f motion=%.2fpx frames=%d)",
+                 shape_deform, SHAPE_DEFORM_MIN, avg_motion, s.frames);
         return LIVENESS_FAIL_STATIC;
     }
 
     // ---- Out of frames without meeting the challenge. ----
     if (s.frames >= LIVENESS_MAX_FRAMES) {
-        ESP_LOGW(TAG, "FAIL_TIMEOUT: pose_range=%.3f (<%.3f) motion=%.2fpx frames=%d",
-                 pose_range, POSE_OFFSET_RANGE_MIN, avg_motion, s.frames);
+        ESP_LOGW(TAG, "FAIL_TIMEOUT: deform=%.3f (<%.3f) motion=%.2fpx frames=%d",
+                 shape_deform, SHAPE_DEFORM_MIN, avg_motion, s.frames);
         return LIVENESS_FAIL_TIMEOUT;
     }
 
