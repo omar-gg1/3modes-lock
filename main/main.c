@@ -1,4 +1,5 @@
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -13,9 +14,22 @@
 #include "debug_server.h"
 #include "crypto_ctrl.h"
 #include "liveness_ctrl.h"
+#include "mqtt_ctrl.h"
+#include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
 #define FACE_MATCH_THRESHOLD 0.6f
+
+// ---- Mode 2 (Hybrid) reporting ----
+// 1 = connect Wi-Fi and report each access event to the backend over MQTT.
+// 0 = pure Mode 1 (offline, no network). Reporting is a SIDE EFFECT only: the
+// lock decides + acts locally regardless, and never blocks on the network. If
+// Wi-Fi/broker is unavailable at boot or at runtime, events are silently dropped
+// and the lock keeps working exactly as in Mode 1. See [[mode2-backend]].
+#define MODE2_REPORTING_ENABLED 1
+// How long to wait for Wi-Fi at boot before giving up and running offline. Short
+// so a missing network barely delays startup.
+#define WIFI_CONNECT_TIMEOUT_MS 8000
 
 // Master switch for the liveness challenge. 1 = require a brief frontal-motion
 // challenge after a face match before unlocking (anti-photo-spoof). 0 = face
@@ -114,6 +128,19 @@ void app_main(void) {
     camera_ctrl_init();
     face_ctrl_init();
 
+    // ---- Mode 2 (Hybrid) network bring-up ----
+    // Done LAST, after the lock is fully functional, so a missing/slow network
+    // never delays or blocks the core lock. On any failure we log and continue
+    // in Mode 1 — reporting is optional, the lock is not.
+    if (MODE2_REPORTING_ENABLED) {
+        if (wifi_ctrl_connect(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
+            ESP_LOGI(TAG, "Wi-Fi connected — starting MQTT reporting (Mode 2)");
+            mqtt_ctrl_init();  // async; reconnects in the background on its own
+        } else {
+            ESP_LOGW(TAG, "Wi-Fi unavailable — running OFFLINE (Mode 1), no reporting");
+        }
+    }
+
     ESP_LOGI(TAG, "System ready.");
     ESP_LOGI(TAG, "  - Show enrolled face: unlock");
     ESP_LOGI(TAG, "  - Tap BOOT: manual unlock");
@@ -141,6 +168,11 @@ void app_main(void) {
     // How long the current cooldown lasts. Normally UNLOCK_COOLDOWN_MS, but a
     // confirm-PIN lockout sets it to CONFIRM_LOCKOUT_MS for a longer rest.
     int     cooldown_ms = UNLOCK_COOLDOWN_MS;
+    // The face match that started the current liveness/confirm flow, carried
+    // forward so the Mode 2 event we report at unlock/deny names the right user
+    // and score even though those values were read back in the scanning state.
+    int     pending_face_id = -1;
+    float   pending_face_score = NAN;
     // Diagnostics: why frames are lost during a liveness challenge.
     int lv_bad_jpeg = 0, lv_no_face = 0, lv_no_frame = 0;
 
@@ -190,8 +222,10 @@ void app_main(void) {
                 } else {
                     if (strcmp(pin_buf, UNLOCK_PIN) == 0) {
                         lock_ctrl_trigger_unlock("PIN code");
+                        mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, true);
                     } else {
                         ESP_LOGW(TAG, "Wrong unlock PIN");
+                        mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, false);
                     }
                 }
                 pin_len = 0;
@@ -209,6 +243,7 @@ void app_main(void) {
         // ---- BOOT button: manual unlock fallback ----
         if (button_ctrl_was_pressed()) {
             lock_ctrl_trigger_unlock("BOOT button press");
+            mqtt_ctrl_publish_event(MQTT_METHOD_BUTTON, -1, NAN, true);
         }
 
         // ---- Enrollment timeout ----
@@ -278,11 +313,15 @@ void app_main(void) {
                         } else {
                             // Confirm PIN disabled: liveness PASS unlocks directly.
                             lock_ctrl_trigger_unlock("face match + liveness");
+                            mqtt_ctrl_publish_event(MQTT_METHOD_FACE,
+                                                    pending_face_id, pending_face_score, true);
                             cooldown_started_at_us = esp_timer_get_time();
                             face_state = FACE_COOLDOWN;
                         }
                     } else if (lv == LIVENESS_FAIL_STATIC) {
                         ESP_LOGW(TAG, ">>> DENIED: static image (photo spoof) suspected");
+                        mqtt_ctrl_publish_event(MQTT_METHOD_FACE,
+                                                pending_face_id, pending_face_score, false);
                         cooldown_started_at_us = esp_timer_get_time();
                         face_state = FACE_COOLDOWN;
                     }
@@ -302,6 +341,8 @@ void app_main(void) {
                 ESP_LOGW(TAG, ">>> DENIED: liveness timeout "
                          "(bad_jpeg=%d no_face=%d no_frame=%d) — resting",
                          lv_bad_jpeg, lv_no_face, lv_no_frame);
+                mqtt_ctrl_publish_event(MQTT_METHOD_FACE,
+                                        pending_face_id, pending_face_score, false);
                 cooldown_started_at_us = esp_timer_get_time();
                 face_state = FACE_COOLDOWN;
             }
@@ -328,12 +369,16 @@ void app_main(void) {
                         // Second factor satisfied — unlock for real.
                         confirm_strikes = 0;  // reset on success
                         lock_ctrl_trigger_unlock("face + liveness + confirm PIN");
+                        mqtt_ctrl_publish_event(MQTT_METHOD_FACE,
+                                                pending_face_id, pending_face_score, true);
                         cooldown_started_at_us = esp_timer_get_time();
                         face_state = FACE_COOLDOWN;
                     } else {
                         confirm_strikes++;
                         ESP_LOGW(TAG, ">>> DENIED: wrong confirm PIN (strike %d/%d)",
                                  confirm_strikes, CONFIRM_PIN_MAX_STRIKES);
+                        mqtt_ctrl_publish_event(MQTT_METHOD_FACE,
+                                                pending_face_id, pending_face_score, false);
                         // Reset buffer either way; decide rest vs lockout below.
                         confirm_len = 0;
                         confirm_buf[0] = 0;
@@ -362,6 +407,8 @@ void app_main(void) {
                 confirm_strikes++;
                 ESP_LOGW(TAG, ">>> DENIED: confirm PIN timeout (strike %d/%d) — resting",
                          confirm_strikes, CONFIRM_PIN_MAX_STRIKES);
+                mqtt_ctrl_publish_event(MQTT_METHOD_FACE,
+                                        pending_face_id, pending_face_score, false);
                 confirm_len = 0;
                 confirm_buf[0] = 0;
                 if (confirm_strikes >= CONFIRM_PIN_MAX_STRIKES) {
@@ -388,6 +435,10 @@ void app_main(void) {
                 if (face_ctrl_recognize(&matched_id, &similarity) == ESP_OK) {
                     ESP_LOGI(TAG, "match: id=%d similarity=%.3f", matched_id, similarity);
                     if (similarity > FACE_MATCH_THRESHOLD) {
+                        // Remember who matched so the eventual unlock/deny event
+                        // (reported from a later state) names this user + score.
+                        pending_face_id = matched_id;
+                        pending_face_score = similarity;
                         if (LIVENESS_ENABLED) {
                             // Hand off to the liveness challenge (recognition stops).
                             ESP_LOGI(TAG, ">>> Face matched (user %d). Liveness: LEAN IN / MOVE A LITTLE",
@@ -400,6 +451,7 @@ void app_main(void) {
                             // Liveness disabled: a confident match unlocks directly.
                             ESP_LOGI(TAG, ">>> Face matched (user %d) — unlocking", matched_id);
                             lock_ctrl_trigger_unlock("face match");
+                            mqtt_ctrl_publish_event(MQTT_METHOD_FACE, matched_id, similarity, true);
                             cooldown_started_at_us = esp_timer_get_time();
                             face_state = FACE_COOLDOWN;
                         }

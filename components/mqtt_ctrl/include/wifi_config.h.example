@@ -1,0 +1,25 @@
+#pragma once
+//
+// Mode 2 (Hybrid) network config — COPY this file to wifi_config.h and fill in
+// your real values. wifi_config.h is gitignored (**/wifi_config.h) so secrets
+// never get committed. Used by main.c (Wi-Fi) and mqtt_ctrl.c (broker).
+//
+
+// ---- Wi-Fi (STA) ----
+#define WIFI_SSID      "your-network-ssid"
+#define WIFI_PASSWORD  "your-network-password"
+
+// ---- MQTT broker ----
+// Local dev (PC running docker compose): "mqtt://<your-PC-LAN-IP>:1883"
+// AWS free tier: "mqtt://<public-host>:1883" — and you MUST add auth+TLS
+//   (mqtts://, username/password below) before exposing a broker to the
+//   internet, or you are broadcasting access events publicly.
+#define MQTT_BROKER_URI "mqtt://192.168.1.100:1883"
+
+// Identifies this lock; becomes the topic smartlock/<MQTT_DEVICE_ID>/events.
+#define MQTT_DEVICE_ID  "lock-01"
+
+// ---- Optional broker auth ----
+// Uncomment BOTH to enable username/password auth (required for a public broker).
+// #define MQTT_USERNAME  "smartlock"
+// #define MQTT_PASSWORD  "change-me"
