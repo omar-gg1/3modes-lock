@@ -1,0 +1,28 @@
+# Project sdkconfig defaults — applied by idf.py on top of board defaults.
+# Captured 2026-07-01.
+#
+# ROOT CAUSE of the MQTT crash-loop: NOT memory exhaustion. The main task stack
+# was only 3584 bytes, but app_main runs camera init + face-model load + Wi-Fi
+# connect + SNTP init + MQTT init all on it. The deep SNTP/MQTT call chain
+# overflowed the main-task stack and scribbled into the adjacent heap, corrupting
+# the TLSF allocator — so the NEXT heap calloc (esp_mqtt_client_init) tripped
+# `block_size(block) >= size`. That is a corruption assert, not an out-of-memory:
+# 268 KiB was free, yet a tiny calloc failed. The fix is a bigger main stack.
+#
+# (Earlier wrong turns, left here as a warning: enabling
+# SPIRAM_TRY_ALLOCATE_WIFI_LWIP corrupted the heap via unsafe PSRAM Wi-Fi DMA on
+# this octal-PSRAM module — do NOT re-enable it. Shrinking Wi-Fi/MQTT buffers did
+# not help because the bug was the stack, not buffer size.)
+
+# THE FIX: give the main task enough stack for camera+wifi+sntp+mqtt bring-up.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Catch any future stack overflow with a clear panic instead of heap corruption.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+
+# Drop unused MQTT transports (we use plain mqtt:// only) — saves some RAM/flash.
+CONFIG_MQTT_TRANSPORT_SSL=n
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
+
+# Keep Wi-Fi/LWIP in internal RAM (PSRAM Wi-Fi DMA is unsafe on this module).
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set

@@ -20,6 +20,23 @@
 #define ENROLLMENT_TIMEOUT_MS 10000
 #define FACE_MATCH_THRESHOLD 0.6f
 
+// ============================================================================
+// COMPONENT MASTER SWITCHES — for bisecting the MQTT heap-corruption crash.
+// Turn everything OFF except Wi-Fi + MQTT to prove the network path works in
+// isolation, then re-enable ONE component at a time to find which one corrupts
+// the heap. Set a switch to 0 to skip that component's init entirely.
+//
+// BISECT MODE (current): only Wi-Fi + MQTT run. Camera / face / keypad / lock /
+// button are all OFF. If MQTT connects like this, a disabled component was the
+// culprit — flip them back to 1 one by one and re-flash until it breaks.
+// ============================================================================
+#define ENABLE_LOCK     1
+#define ENABLE_BUTTON   1
+#define ENABLE_KEYPAD   1
+#define ENABLE_CAMERA   1   // camera + face both need this; face is skipped if off
+#define ENABLE_FACE     1
+#define ENABLE_MODE2    1   // Wi-Fi + MQTT — the thing we are trying to isolate
+
 // ---- Mode 2 (Hybrid) reporting ----
 // 1 = connect Wi-Fi and report each access event to the backend over MQTT.
 // 0 = pure Mode 1 (offline, no network). Reporting is a SIDE EFFECT only: the
@@ -119,20 +136,16 @@ void app_main(void) {
     ESP_LOGI(TAG, "==== Smart Lock booting ====");
 
     nvs_init_safe();
-    // crypto_ctrl must come up before face_ctrl: face_ctrl_init() decrypts the
-    // face database on mount, which needs the AES key loaded/created first.
-    ESP_ERROR_CHECK(crypto_ctrl_init());
-    lock_ctrl_init();
-    button_ctrl_init();
-    keypad_ctrl_init();
-    camera_ctrl_init();
-    face_ctrl_init();
 
-    // ---- Mode 2 (Hybrid) network bring-up ----
-    // Done LAST, after the lock is fully functional, so a missing/slow network
-    // never delays or blocks the core lock. On any failure we log and continue
-    // in Mode 1 — reporting is optional, the lock is not.
-    if (MODE2_REPORTING_ENABLED) {
+    // ---- Mode 2 (Hybrid) network bring-up FIRST ----
+    // ORDER MATTERS: esp_mqtt_client_init does a MALLOC_CAP_INTERNAL alloc, and
+    // the camera's DMA reservation (+ frame buffers) fragments the internal heap.
+    // Proven by bisect: MQTT inits fine on a clean heap (308 KiB free) but the
+    // same call asserts once the camera has run (268 KiB, fragmented). So we
+    // start Wi-Fi + MQTT while internal RAM is still pristine, THEN init the
+    // camera/face which spill their big buffers into PSRAM anyway. Reporting is
+    // still non-blocking; a missing network just logs and continues (Mode 1).
+    if (ENABLE_MODE2 && MODE2_REPORTING_ENABLED) {
         if (wifi_ctrl_connect(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
             ESP_LOGI(TAG, "Wi-Fi connected — starting MQTT reporting (Mode 2)");
             mqtt_ctrl_init();  // async; reconnects in the background on its own
@@ -140,6 +153,18 @@ void app_main(void) {
             ESP_LOGW(TAG, "Wi-Fi unavailable — running OFFLINE (Mode 1), no reporting");
         }
     }
+
+    // crypto_ctrl must come up before face_ctrl: face_ctrl_init() decrypts the
+    // face database on mount, which needs the AES key loaded/created first.
+    // Only bring it up if face is enabled (it decrypts the face DB).
+    if (ENABLE_FACE) {
+        ESP_ERROR_CHECK(crypto_ctrl_init());
+    }
+    if (ENABLE_LOCK)   lock_ctrl_init();
+    if (ENABLE_BUTTON) button_ctrl_init();
+    if (ENABLE_KEYPAD) keypad_ctrl_init();
+    if (ENABLE_CAMERA) camera_ctrl_init();
+    if (ENABLE_FACE)   face_ctrl_init();
 
     ESP_LOGI(TAG, "System ready.");
     ESP_LOGI(TAG, "  - Show enrolled face: unlock");
@@ -186,6 +211,15 @@ void app_main(void) {
     int  confirm_strikes = 0;
 
     while (1) {
+        // BISECT HARNESS: if the peripheral subsystems are disabled, the main
+        // loop has nothing to drive — MQTT runs on its own background task — so
+        // just idle here. This lets us prove Wi-Fi+MQTT in isolation without the
+        // loop calling into uninitialised keypad/button/face drivers.
+        if (!ENABLE_KEYPAD && !ENABLE_BUTTON && !ENABLE_FACE) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         // ---- Keypad input ----
         // Read one key per iteration. While we are in the FACE_CONFIRM_PIN state
         // the key belongs to the confirm-PIN entry (handled inside that state

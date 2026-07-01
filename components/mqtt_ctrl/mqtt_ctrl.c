@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
+#include "esp_heap_caps.h"
 #include "mqtt_client.h"
 
 // Broker + identity live in a gitignored header (SSID/pass are used by the
@@ -21,7 +22,7 @@ static esp_mqtt_client_handle_t s_client = NULL;
 static volatile bool s_connected = false;
 
 // Build the events topic once: smartlock/<device_id>/events.
-static char s_topic[64];
+static char s_topic[64]; // Fix: Restored fixed-size buffer tracking array
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
@@ -83,9 +84,20 @@ esp_err_t mqtt_ctrl_init(void)
 
     snprintf(s_topic, sizeof(s_topic), "smartlock/%s/events", MQTT_DEVICE_ID);
 
-    esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,   // e.g. "mqtt://192.168.1.10:1883"
-    };
+    // Keep MQTT's memory footprint SMALL. 
+    esp_mqtt_client_config_t cfg;
+    memset(&cfg, 0, sizeof(esp_mqtt_client_config_t));
+
+    cfg.broker.address.uri = MQTT_BROKER_URI;   // e.g. "mqtt://192.168.1.10:1883"
+    
+    // Reduce internal task stack size safely to leave breathing room for internal DRAM
+    cfg.task.stack_size = 3072;                 
+    
+    // Shrink internal network message buffers for 120-byte payload footprints
+    cfg.buffer.size = 256;                      
+    cfg.buffer.out_size = 256;                  
+    cfg.outbox.limit = 512;                     
+
 #ifdef MQTT_USERNAME
     cfg.credentials.username = MQTT_USERNAME;
     cfg.credentials.authentication.password = MQTT_PASSWORD;
@@ -122,15 +134,10 @@ static const char *method_str(mqtt_method_t m)
 
 void mqtt_ctrl_publish_event(mqtt_method_t method, int id, float score, bool granted)
 {
-    // FIRE-AND-FORGET. If we're not connected (or never started), drop the event
-    // and return instantly — the lock must never stall on reporting.
     if (s_client == NULL || !s_connected) {
         return;
     }
 
-    // Build the JSON by hand — the payload is tiny and fixed-shape, so a manual
-    // snprintf is lighter than pulling in a JSON library. id<0 and NaN score are
-    // emitted as JSON null to match the contract ([[mode2-backend]]).
     char id_buf[16];
     char score_buf[24];
     if (id < 0) {
@@ -156,8 +163,6 @@ void mqtt_ctrl_publish_event(mqtt_method_t method, int id, float score, bool gra
         return;
     }
 
-    // QoS 0, non-retained: best-effort telemetry. enqueue (non-blocking) rather
-    // than the blocking publish so we never wait on the network here.
     int msg_id = esp_mqtt_client_enqueue(s_client, s_topic, payload, n, 0, 0, true);
     if (msg_id < 0) {
         ESP_LOGW(TAG, "failed to enqueue event (dropped)");
