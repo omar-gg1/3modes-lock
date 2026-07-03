@@ -63,7 +63,10 @@ services:
     image: phpmyadmin:5
     container_name: smartlock-phpmyadmin
     ports:
-      - "8080:80"
+      # Host port 8091 (not 8080): 8080 is a well-known proxy port that many
+      # ISPs/networks filter outbound, which made phpMyAdmin unreachable from
+      # some browsers. 8091 avoids that. Open 8091 in the EC2 security group.
+      - "8091:80"
     environment:
       PMA_HOST: mysql
       PMA_PORT: "3306"
