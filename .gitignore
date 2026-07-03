@@ -15,3 +15,5 @@ __pycache__/
 
 # firmware secrets (Wi-Fi / broker config, never commit)
 **/wifi_config.h
+
+smartlock-backend-key.pem
