@@ -10,6 +10,7 @@ sm-lock-fnl.docx
 backend/**/*.db
 backend/**/__pycache__/
 backend/.env
+backend/mosquitto/passwd
 __pycache__/
 
 # firmware secrets (Wi-Fi / broker config, never commit)

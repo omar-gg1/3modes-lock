@@ -20,7 +20,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import mqtt_client
-from .database import SessionLocal, AccessEvent, init_db
+from .database import SessionLocal, AccessEvent, init_db, wait_for_db
 from .schemas import AccessEventOut
 
 logging.basicConfig(level=logging.INFO,
@@ -30,6 +30,7 @@ logging.basicConfig(level=logging.INFO,
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
+    wait_for_db()   # block until MySQL is up (no-op for SQLite)
     init_db()
     mqtt_client.start()
     yield

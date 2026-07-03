@@ -1,22 +1,57 @@
 """Database setup — SQLAlchemy engine, session, and the AccessEvent model.
 
-SQLite for dev (a single file). The DATABASE_URL env var switches this to
-Postgres for the AWS demo without changing any of the code below.
+The DATABASE_URL env var selects the backend with NO code changes:
+  - sqlite:///./smartlock.db          (local quick dev)
+  - mysql+pymysql://user:pw@host/db   (the MySQL stack, local + AWS EC2)
 """
+import logging
 import os
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+log = logging.getLogger("database")
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./smartlock.db")
+_is_sqlite = DATABASE_URL.startswith("sqlite")
 
 # check_same_thread is a SQLite-only quirk: the MQTT subscriber runs on a
 # different thread than the API, and SQLite otherwise refuses cross-thread use.
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+connect_args = {"check_same_thread": False} if _is_sqlite else {}
+
+# pool_pre_ping recycles dead connections — important for MySQL, whose server
+# drops idle connections after a timeout; without this the API throws
+# "MySQL server has gone away" after a quiet period.
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=not _is_sqlite,
+)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
+
+
+def wait_for_db(max_wait_s: int = 60) -> None:
+    """Block until the DB accepts a connection. MySQL takes 15-30s to init on
+    first container boot, so the API must not give up connecting too early. A
+    no-op for SQLite (a local file is always ready)."""
+    if _is_sqlite:
+        return
+    deadline = time.time() + max_wait_s
+    while True:
+        try:
+            with engine.connect():
+                log.info("database is ready")
+                return
+        except OperationalError as e:
+            if time.time() >= deadline:
+                log.error("database not ready after %ds: %s", max_wait_s, e)
+                raise
+            log.info("waiting for database to come up...")
+            time.sleep(2)
 
 
 class AccessEvent(Base):
@@ -29,10 +64,12 @@ class AccessEvent(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    device_id = Column(String, index=True)          # which lock (from the MQTT topic)
-    event = Column(String)                           # e.g. "access"
-    method = Column(String, index=True)              # "face" | "pin" | "button"
-    result = Column(String, index=True)              # "granted" | "denied"
+    # MySQL requires an explicit VARCHAR length (SQLite does not). These are
+    # short enum-ish strings, so modest lengths are plenty.
+    device_id = Column(String(64), index=True)       # which lock (from the MQTT topic)
+    event = Column(String(32))                       # e.g. "access"
+    method = Column(String(16), index=True)          # "face" | "pin" | "button"
+    result = Column(String(16), index=True)          # "granted" | "denied"
     user_id = Column(Integer, nullable=True)         # matched face id, if any
     score = Column(Float, nullable=True)             # similarity score, if face
 

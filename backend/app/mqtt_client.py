@@ -23,6 +23,10 @@ MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
 # '+' is a single-level wildcard: matches any device id in that slot.
 MQTT_EVENT_TOPIC = os.environ.get("MQTT_EVENT_TOPIC", "smartlock/+/events")
+# Broker auth (empty = anonymous, for a local no-auth broker). On AWS the broker
+# requires these, matching the firmware's MQTT_USERNAME/MQTT_PASSWORD.
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 
 _client: mqtt.Client | None = None
 
@@ -78,6 +82,8 @@ def start():
     """Connect and start the background network loop. Called on API startup."""
     global _client
     _client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    if MQTT_USERNAME:
+        _client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
     _client.on_connect = _on_connect
     _client.on_message = _on_message
 

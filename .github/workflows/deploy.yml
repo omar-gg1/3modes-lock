@@ -1,0 +1,68 @@
+name: Build & Deploy backend to EC2
+
+# On push to master touching the backend:
+#   1. Build the API image and push it to GHCR.
+#   2. SSH to EC2 -> git pull (for compose/config) -> pull API image -> restart.
+# The broker uses the stock eclipse-mosquitto image + server-side config, so only
+# the API image is built here.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {}   # manual runs from the Actions tab
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}   # lowercased in the step below
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase image prefix
+        id: prep
+        run: echo "prefix=$(echo '${{ env.IMAGE_PREFIX }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/app/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ steps.prep.outputs.prefix }}-api:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/smartlock
+            # Refresh compose files + mosquitto.conf from git (repo cloned here).
+            git pull --ff-only
+            cd backend
+            # Log into GHCR so the host can pull the (private) API image.
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
+            docker image prune -f

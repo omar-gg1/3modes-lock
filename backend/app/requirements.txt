@@ -3,3 +3,7 @@ uvicorn[standard]==0.34.0
 sqlalchemy==2.0.36
 paho-mqtt==2.1.0
 pydantic==2.10.4
+# MySQL driver — lets SQLAlchemy talk to MySQL/MariaDB via a
+# mysql+pymysql:// DATABASE_URL. Pure-Python, no build step.
+PyMySQL==1.1.1
+cryptography==44.0.0

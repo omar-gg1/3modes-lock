@@ -1,29 +1,25 @@
-# Smart Lock — Mode 2 (Hybrid) backend stack.
+# PRODUCTION compose for the EC2 host — pulls pre-built images from GHCR
+# instead of building locally (the CI builds & pushes them). Secrets come from
+# a server-side .env that is NEVER committed (see .env.example + SETUP-AWS.md).
 #
-# Four services, identical locally and on the AWS EC2 host:
-#   mosquitto  : MQTT broker the ESP32 publishes access events to (auth required)
-#   mysql      : stores the events (the DB behind phpMyAdmin)
-#   api        : FastAPI — subscribes to events, writes them to MySQL, serves REST
-#   phpmyadmin : web GUI to browse the MySQL data
+# IMAGE_PREFIX must be set in the server .env, e.g.:
+#   IMAGE_PREFIX=ghcr.io/omar-gg1/3modes-lock
 #
-# Secrets come from a gitignored .env file (see .env.example). Bring it up with:
-#   docker compose up -d --build
-#
-# Ports (lock down 8080/8000/1883 in the AWS security group — see README):
-#   1883 MQTT | 8000 REST API | 8080 phpMyAdmin | 3306 MySQL (internal only)
+# Deploy:  docker compose -f docker-compose.prod.yml pull && up -d
 
 services:
   mosquitto:
-    # Built from mosquitto/Dockerfile so the config + password file are baked in
-    # with correct ownership (a bind-mounted passwd from Windows is world-readable
-    # and Mosquitto 2.x rejects it). Rebuild after changing the passwd/conf.
-    build:
-      context: ./mosquitto
-      dockerfile: Dockerfile
+    # Base image + server-side config/passwd mounted from ~/smartlock/mosquitto/
+    # (generated on the EC2 host by setup — the passwd is a secret, never in git
+    # or an image). On Linux the mounted passwd gets correct perms, so no custom
+    # image is needed here (unlike the Windows-dev build).
+    image: eclipse-mosquitto:2
     container_name: smartlock-mosquitto
     ports:
       - "1883:1883"
     volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
       - mosquitto_data:/mosquitto/data
     restart: unless-stopped
 
@@ -37,8 +33,6 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     volumes:
       - mysql_data:/var/lib/mysql
-    # NOTE: 3306 is intentionally NOT published to the host — only the other
-    # containers reach MySQL over the internal compose network. Never expose it.
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
@@ -47,9 +41,7 @@ services:
     restart: unless-stopped
 
   api:
-    build:
-      context: .
-      dockerfile: app/Dockerfile
+    image: ${IMAGE_PREFIX}-api:latest
     container_name: smartlock-api
     ports:
       - "8000:8000"
