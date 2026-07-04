@@ -43,7 +43,11 @@ esp_err_t camera_ctrl_init(void) {
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,    // 320x240 — matches the recognizer input
+        // QVGA (320x240) is the LOCAL recognizer's expected input (face_ctrl
+        // decodes into a fixed 320x240 buffer). For Mode 3 the cloud needs a
+        // bigger face, so camera_ctrl_grab_highres() temporarily switches the
+        // sensor to VGA for a single frame — see below. Base stays QVGA.
+        .frame_size = FRAMESIZE_QVGA,    // 320x240 — local recognizer input
         // jpeg_quality: LOWER number = BETTER quality (less compression). 10 gives
         // the recognizer cleaner pixels than the old 15, which raises and steadies
         // similarity scores. The recognizer is the consumer, not a human eye, so
@@ -84,4 +88,32 @@ camera_fb_t *camera_ctrl_get_frame(void) {
 
 void camera_ctrl_return_frame(camera_fb_t *fb) {
     if (fb) esp_camera_fb_return(fb);
+}
+
+camera_fb_t *camera_ctrl_grab_highres(void) {
+    // Temporarily raise the sensor to VGA (640x480) for ONE frame so the cloud
+    // verifier gets a large enough face, then restore QVGA for the local
+    // recognizer. The local pipeline decodes a fixed 320x240 buffer, so the base
+    // resolution must stay QVGA; only this one-off cloud grab is bigger.
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        return esp_camera_fb_get();   // fall back to whatever size we're at
+    }
+    s->set_framesize(s, FRAMESIZE_VGA);
+    // Drain a couple of frames so the new (bigger) size actually flushes through
+    // the DMA buffers — the first frame(s) after a size change can be the old
+    // size or partial.
+    for (int i = 0; i < 2; i++) {
+        camera_fb_t *drop = esp_camera_fb_get();
+        if (drop) esp_camera_fb_return(drop);
+    }
+    camera_fb_t *fb = esp_camera_fb_get();   // the real VGA frame
+    // Restore QVGA for local recognition and drain again so the next local
+    // detect gets a proper 320x240 frame.
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    for (int i = 0; i < 2; i++) {
+        camera_fb_t *drop = esp_camera_fb_get();
+        if (drop) esp_camera_fb_return(drop);
+    }
+    return fb;
 }

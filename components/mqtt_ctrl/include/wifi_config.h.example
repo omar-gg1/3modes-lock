@@ -23,3 +23,9 @@
 // Uncomment BOTH to enable username/password auth (required for a public broker).
 // #define MQTT_USERNAME  "smartlock"
 // #define MQTT_PASSWORD  "change-me"
+
+// ---- Mode 3 cloud verifier (ArcFace second opinion) ----
+// Base URL (no trailing slash) of the verifier + its X-API-Key. Must match the
+// server's VERIFIER_API_KEY. Only used when MODE3_ENABLED in main.c.
+#define VERIFIER_URL      "http://<public-host>:9000"
+#define VERIFIER_API_KEY  "change-me-verifier-key"

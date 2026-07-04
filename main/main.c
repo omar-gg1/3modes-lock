@@ -15,10 +15,27 @@
 #include "crypto_ctrl.h"
 #include "liveness_ctrl.h"
 #include "mqtt_ctrl.h"
+#include "cloud_verify_ctrl.h"
 #include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
 #define FACE_MATCH_THRESHOLD 0.6f
+
+// ---- Mode 3 (Cloud-Assisted) ----
+// Local recognition runs first; only MURKY-confidence matches ask the cloud
+// ArcFace verifier for a confident second opinion. Confident local cases never
+// touch the network (fast, offline-capable). If the cloud is unreachable during
+// a murky case, we fall back to a local decision (graceful degrade).
+// 0 = pure local recognition (Mode 1/2 behaviour).
+#define MODE3_ENABLED   1
+// Similarity bands on the LOCAL model's score:
+//   sim >= MODE3_HIGH_THR  -> confident local YES (unlock via the normal path)
+//   sim <  MODE3_LOW_THR   -> confident local NO  (deny)
+//   in between             -> MURKY -> ask the cloud
+// The local model's genuine scores run ~0.55-0.83, so the murky band sits where
+// the local model is genuinely unsure. Tune from real data.
+#define MODE3_HIGH_THR  0.75f
+#define MODE3_LOW_THR   0.50f
 
 // ============================================================================
 // COMPONENT MASTER SWITCHES — for bisecting the MQTT heap-corruption crash.
@@ -333,7 +350,11 @@ void app_main(void) {
                 if (face_ctrl_get_keypoints(kp, KEYPOINT_BUF_LEN, &kp_count) == ESP_OK) {
                     liveness_result_t lv = liveness_ctrl_feed(kp, kp_count);
                     if (lv == LIVENESS_PASS) {
-                        if (CONFIRM_PIN_ENABLED) {
+                        // In MODE 3 the cloud ArcFace verdict already served as the
+                        // strong second factor, so we skip the confirm PIN (cloud =
+                        // identity, liveness = presence — enough). The PIN is only
+                        // the second factor in Mode 1/2 where there's no cloud.
+                        if (CONFIRM_PIN_ENABLED && !MODE3_ENABLED) {
                             // Liveness alone can't reject a hand-held photo on
                             // this detector, so require a secret second factor:
                             // hand off to the confirm-PIN phase (lock stays shut).
@@ -468,13 +489,58 @@ void app_main(void) {
                 float similarity;
                 if (face_ctrl_recognize(&matched_id, &similarity) == ESP_OK) {
                     ESP_LOGI(TAG, "match: id=%d similarity=%.3f", matched_id, similarity);
-                    if (similarity > FACE_MATCH_THRESHOLD) {
+
+                    // Decide whether this local match is CONFIDENT enough to
+                    // proceed, or MURKY (ask the cloud), or clearly a non-match.
+                    //   - Mode 3 ON: high -> proceed locally, murky -> cloud,
+                    //     low -> ignore.
+                    //   - Mode 3 OFF: the old single-threshold behaviour.
+                    bool proceed = false;   // proceed to liveness/unlock for this user
+
+                    if (MODE3_ENABLED) {
+                        if (similarity >= MODE3_HIGH_THR) {
+                            // Confident local YES — no cloud needed.
+                            proceed = true;
+                        } else if (similarity > MODE3_LOW_THR) {
+                            // MURKY: ask the cloud ArcFace verifier for a second
+                            // opinion on the current frame.
+                            ESP_LOGI(TAG, ">>> Local UNSURE (%.3f in murky band) — asking cloud...",
+                                     similarity);
+                            int cloud_uid = -1; float cloud_conf = 0.0f;
+                            cloud_verify_result_t cv =
+                                cloud_verify_current_frame(&cloud_uid, &cloud_conf);
+                            if (cv == CLOUD_VERIFY_MATCH) {
+                                ESP_LOGI(TAG, ">>> Cloud CONFIRMED (user %d, conf %.3f)",
+                                         cloud_uid, cloud_conf);
+                                matched_id = cloud_uid;   // trust the cloud's id
+                                proceed = true;
+                            } else if (cv == CLOUD_VERIFY_NO_MATCH) {
+                                ESP_LOGW(TAG, ">>> Cloud REJECTED (conf %.3f) — denying",
+                                         cloud_conf);
+                                mqtt_ctrl_publish_event(MQTT_METHOD_FACE, matched_id, similarity, false);
+                                proceed = false;
+                            } else {
+                                // Cloud unreachable — graceful degrade to a local
+                                // decision using the normal threshold.
+                                ESP_LOGW(TAG, ">>> Cloud unreachable — local fallback");
+                                proceed = (similarity > FACE_MATCH_THRESHOLD);
+                            }
+                        }
+                        // similarity <= MODE3_LOW_THR -> proceed stays false (deny)
+                    } else {
+                        // Mode 3 disabled: original single-threshold behaviour.
+                        proceed = (similarity > FACE_MATCH_THRESHOLD);
+                    }
+
+                    if (proceed) {
                         // Remember who matched so the eventual unlock/deny event
                         // (reported from a later state) names this user + score.
                         pending_face_id = matched_id;
                         pending_face_score = similarity;
                         if (LIVENESS_ENABLED) {
-                            // Hand off to the liveness challenge (recognition stops).
+                            // Even after a cloud match we still run liveness: the
+                            // cloud proves IDENTITY, liveness proves PRESENCE (a
+                            // printed photo of the right person can't lean/move).
                             ESP_LOGI(TAG, ">>> Face matched (user %d). Liveness: LEAN IN / MOVE A LITTLE",
                                      matched_id);
                             liveness_ctrl_begin();
