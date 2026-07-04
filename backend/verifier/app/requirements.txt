@@ -8,3 +8,6 @@ numpy==1.26.4
 opencv-python-headless==4.10.0.84
 onnxruntime==1.19.2
 insightface==0.7.3
+# --- evaluation module (Phase B: FAR/FRR/EER/ROC) ---
+scikit-learn==1.5.2   # LFW dataset fetch + utilities
+matplotlib==3.9.2     # ROC + score-distribution plots

@@ -140,3 +140,59 @@ async def verify(
 def encodings(x_api_key: str | None = Header(default=None)):
     _check_key(x_api_key)
     return {"total_encodings": storage.count_encodings()}
+
+
+# ---- Evaluation insights (Phase B) --------------------------------------
+# Read-only views over the eval_runs / eval_scores tables so you can pull live
+# FAR/FRR/EER/score-distributions for any past evaluation run without re-running
+# it. The heavy run itself is done offline via `python -m eval.run_eval`.
+
+@app.get("/eval/runs")
+def eval_runs(x_api_key: str | None = Header(default=None)):
+    """List all evaluation runs with their headline metrics."""
+    _check_key(x_api_key)
+    from eval import eval_storage
+    s = eval_storage.SessionLocal()
+    try:
+        runs = s.query(eval_storage.EvalRun).order_by(
+            eval_storage.EvalRun.id.desc()).all()
+        return [{
+            "id": r.id, "dataset": r.dataset, "model": r.model,
+            "num_identities": r.num_identities,
+            "num_genuine": r.num_genuine, "num_impostor": r.num_impostor,
+            "eer": r.eer, "eer_threshold": r.eer_threshold, "auc": r.auc,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        } for r in runs]
+    finally:
+        s.close()
+
+
+@app.get("/eval/runs/{run_id}")
+def eval_run_detail(run_id: int, threshold: float | None = None,
+                    x_api_key: str | None = Header(default=None)):
+    """Full metrics for one run, recomputed live from its stored scores. Pass
+    ?threshold=0.4 to also get FAR/FRR at that specific operating point."""
+    _check_key(x_api_key)
+    from eval import eval_storage, metrics as M
+    s = eval_storage.SessionLocal()
+    try:
+        run = s.get(eval_storage.EvalRun, run_id)
+        if run is None:
+            raise HTTPException(404, "run not found")
+        scores = s.query(eval_storage.EvalScore).filter_by(run_id=run_id).all()
+        genuine = [x.similarity for x in scores if x.is_genuine]
+        impostor = [x.similarity for x in scores if not x.is_genuine]
+        m = M.compute(genuine, impostor)
+        out = {
+            "run_id": run_id, "dataset": run.dataset, "model": run.model,
+            "num_genuine": len(genuine), "num_impostor": len(impostor),
+            "eer": round(m.eer, 4), "eer_threshold": round(m.eer_threshold, 4),
+            "auc": round(m.auc, 4),
+        }
+        if threshold is not None:
+            far, frr = M.far_frr_at(genuine, impostor, threshold)
+            out["at_threshold"] = {"threshold": threshold,
+                                   "FAR": round(far, 4), "FRR": round(frr, 4)}
+        return out
+    finally:
+        s.close()

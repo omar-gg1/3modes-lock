@@ -1,0 +1,22 @@
+Face Recognition Evaluation — lfw_test
+Model: buffalo_l    Run id: 1
+============================================================
+Genuine comparisons : 500  (mean 0.459 ± 0.156)
+Impostor comparisons: 500  (mean 0.032 ± 0.063)
+
+EER  : 4.60%   at threshold 0.154
+AUC  : 0.9913   (1.0 = perfect, 0.5 = random)
+
+FAR / FRR at reference thresholds:
+   threshold       FAR       FRR
+       0.154     4.60%     4.60%  <- EER
+       0.200     0.60%     6.80%
+       0.300     0.00%    14.20%
+       0.350     0.00%    21.40%
+       0.400     0.00%    33.20%
+       0.450     0.00%    45.40%
+       0.500     0.00%    60.60%
+
+FAR = False Acceptance Rate (impostor wrongly accepted; security risk)
+FRR = False Rejection Rate (genuine wrongly rejected; usability)
+EER = Equal Error Rate (FAR == FRR); lower is a better recogniser.

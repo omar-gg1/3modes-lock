@@ -78,6 +78,29 @@ def embed_largest_face(image_bgr):
     return emb, quality
 
 
+def embed_aligned_face(image_bgr):
+    """Embed an ALREADY-cropped/aligned face directly, bypassing detection.
+
+    Used for benchmark datasets (e.g. LFW) whose images are pre-cropped tightly
+    to the face — too tight for the scene detector to re-detect, but perfect to
+    feed straight into the recognition model. Resizes to the recognition input
+    (112x112) and returns the L2-normalised 512-d embedding, or None on failure.
+    """
+    import cv2
+    app = _get_app()
+    # The recognition sub-model is registered under 'recognition'.
+    rec = app.models.get("recognition")
+    if rec is None:
+        return None
+    face = cv2.resize(image_bgr, (112, 112), interpolation=cv2.INTER_CUBIC)
+    emb = rec.get_feat(face).flatten()
+    emb = np.asarray(emb, dtype=np.float32)
+    n = np.linalg.norm(emb)
+    if n > 0:
+        emb = emb / n     # L2-normalise so dot product == cosine similarity
+    return emb
+
+
 def cosine_similarity(a, b):
     """Cosine similarity of two L2-normalised vectors = their dot product.
     Range [-1, 1]; same person ~0.4-0.8, different person <~0.3 with ArcFace."""

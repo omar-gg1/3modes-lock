@@ -23,6 +23,7 @@ RUN python -c "from insightface.app import FaceAnalysis; \
 FaceAnalysis(name='${INSIGHTFACE_MODEL}').prepare(ctx_id=-1, det_size=(640,640))"
 
 COPY app/ /srv/app/
+COPY eval/ /srv/eval/
 
 EXPOSE 9000
 

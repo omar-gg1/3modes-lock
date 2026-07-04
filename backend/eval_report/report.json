@@ -1,0 +1,51 @@
+{
+  "dataset": "lfw_test",
+  "model": "buffalo_l",
+  "run_id": 1,
+  "num_genuine": 500,
+  "num_impostor": 500,
+  "genuine_mean": 0.459,
+  "genuine_std": 0.1557,
+  "impostor_mean": 0.0319,
+  "impostor_std": 0.0634,
+  "EER": 0.046,
+  "EER_threshold": 0.1539,
+  "AUC": 0.9913,
+  "far_frr_table": [
+    {
+      "threshold": 0.154,
+      "FAR": 0.046,
+      "FRR": 0.046
+    },
+    {
+      "threshold": 0.2,
+      "FAR": 0.006,
+      "FRR": 0.068
+    },
+    {
+      "threshold": 0.3,
+      "FAR": 0.0,
+      "FRR": 0.142
+    },
+    {
+      "threshold": 0.35,
+      "FAR": 0.0,
+      "FRR": 0.214
+    },
+    {
+      "threshold": 0.4,
+      "FAR": 0.0,
+      "FRR": 0.332
+    },
+    {
+      "threshold": 0.45,
+      "FAR": 0.0,
+      "FRR": 0.454
+    },
+    {
+      "threshold": 0.5,
+      "FAR": 0.0,
+      "FRR": 0.606
+    }
+  ]
+}
