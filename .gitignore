@@ -17,3 +17,8 @@ __pycache__/
 **/wifi_config.h
 
 smartlock-backend-key.pem
+# test face photos (never commit real faces)
+backend/*.jpg
+backend/*.jpeg
+backend/*.png
+photos/

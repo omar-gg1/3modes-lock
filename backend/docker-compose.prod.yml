@@ -63,10 +63,31 @@ services:
     image: phpmyadmin:5
     container_name: smartlock-phpmyadmin
     ports:
-      - "8080:80"
+      # Host port 8091 (not 8080): 8080 is a well-known proxy port that many
+      # ISPs/networks filter outbound, which made phpMyAdmin unreachable from
+      # some browsers. 8091 avoids that. Open 8091 in the EC2 security group.
+      - "8091:80"
     environment:
       PMA_HOST: mysql
       PMA_PORT: "3306"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Mode 3 cloud verifier (ArcFace) — pulled from GHCR, its own container so it
+  # can't affect the Mode 2 pipeline. Heavy on CPU/RAM; watch memory on a small
+  # instance (add swap or resize if it OOMs).
+  verifier:
+    image: ${IMAGE_PREFIX}-verifier:latest
+    container_name: smartlock-verifier
+    ports:
+      - "9000:9000"
+    environment:
+      DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}"
+      VERIFIER_API_KEY: ${VERIFIER_API_KEY}
+      INSIGHTFACE_MODEL: ${INSIGHTFACE_MODEL:-buffalo_l}
+      MATCH_THRESHOLD: ${MATCH_THRESHOLD:-0.40}
     depends_on:
       mysql:
         condition: service_healthy

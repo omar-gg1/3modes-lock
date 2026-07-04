@@ -80,6 +80,25 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Mode 3 cloud verifier (ArcFace). Its OWN container so a heavy/slow model
+  # can't take down the Mode 2 event pipeline. Shares the same MySQL.
+  verifier:
+    build:
+      context: ./verifier
+      dockerfile: Dockerfile
+    container_name: smartlock-verifier
+    ports:
+      - "9000:9000"
+    environment:
+      DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}"
+      VERIFIER_API_KEY: ${VERIFIER_API_KEY}
+      INSIGHTFACE_MODEL: ${INSIGHTFACE_MODEL:-buffalo_l}
+      MATCH_THRESHOLD: ${MATCH_THRESHOLD:-0.40}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   mosquitto_data:
   mysql_data:

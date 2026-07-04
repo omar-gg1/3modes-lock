@@ -45,6 +45,14 @@ jobs:
           push: true
           tags: ${{ env.REGISTRY }}/${{ steps.prep.outputs.prefix }}-api:latest
 
+      - name: Build & push Verifier image (Mode 3 / ArcFace)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend/verifier
+          file: ./backend/verifier/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ steps.prep.outputs.prefix }}-verifier:latest
+
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
