@@ -52,10 +52,23 @@ def embed_largest_face(image_bgr):
     - quality: dict with det_score + face box size, used to warn on poor
       enrollments (small/blurry faces make bad reference embeddings).
     """
+    import cv2
+    # Small sources (the ESP32 sends QVGA 320x240 frames) give the detector a
+    # face near its minimum size. Upscale 2x so detection is reliable; the
+    # recognition crop is normalised to 112x112 afterwards either way, so this
+    # helps detection without distorting recognition.
+    h, w = image_bgr.shape[:2]
+    upscaled = False
+    if max(h, w) < 500:
+        image_bgr = cv2.resize(image_bgr, None, fx=2, fy=2,
+                               interpolation=cv2.INTER_CUBIC)
+        upscaled = True
+
     app = _get_app()
     faces = app.get(image_bgr)
     if not faces:
-        return None, {"error": "no_face_detected"}
+        return None, {"error": "no_face_detected", "upscaled": upscaled,
+                      "src_w": w, "src_h": h}
 
     # Pick the largest face (biggest bounding-box area) = the intended subject,
     # not a bystander in the background.

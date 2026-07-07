@@ -87,7 +87,11 @@ async def enroll(
 ):
     _check_key(x_api_key)
     img = _decode_image(await image.read())
-    emb, quality = face_engine.embed_largest_face(img)
+    try:
+        emb, quality = face_engine.embed_largest_face(img)
+    except Exception as e:
+        log.exception("enroll: embedding failed")
+        raise HTTPException(422, {"error": "processing_error", "detail": str(e)})
     if emb is None:
         raise HTTPException(422, {"error": "no usable face", "detail": quality})
 
@@ -115,7 +119,15 @@ async def verify(
 ):
     _check_key(x_api_key)
     img = _decode_image(await image.read())
-    emb, quality = face_engine.embed_largest_face(img)
+    # Never 500 on a bad frame: the lock treats HTTP!=200 as "cloud unreachable"
+    # and falls back locally, which hides the real reason. A processing failure
+    # is a definitive "couldn't judge this image" — return it as structured JSON.
+    try:
+        emb, quality = face_engine.embed_largest_face(img)
+    except Exception as e:
+        log.exception("verify: embedding failed (img %sx%s)",
+                      img.shape[1], img.shape[0])
+        return {"match": False, "reason": "processing_error", "detail": str(e)}
     if emb is None:
         return {"match": False, "reason": "no_face", "detail": quality}
 

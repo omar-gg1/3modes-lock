@@ -495,7 +495,8 @@ void app_main(void) {
                     //   - Mode 3 ON: high -> proceed locally, murky -> cloud,
                     //     low -> ignore.
                     //   - Mode 3 OFF: the old single-threshold behaviour.
-                    bool proceed = false;   // proceed to liveness/unlock for this user
+                    bool proceed = false;      // proceed to liveness/unlock for this user
+                    bool murky_denied = false; // a cloud-involved DENY -> rest, don't re-hammer
 
                     if (MODE3_ENABLED) {
                         if (similarity >= MODE3_HIGH_THR) {
@@ -503,7 +504,7 @@ void app_main(void) {
                             proceed = true;
                         } else if (similarity > MODE3_LOW_THR) {
                             // MURKY: ask the cloud ArcFace verifier for a second
-                            // opinion on the current frame.
+                            // opinion on the retained frame (the one just scored).
                             ESP_LOGI(TAG, ">>> Local UNSURE (%.3f in murky band) — asking cloud...",
                                      similarity);
                             int cloud_uid = -1; float cloud_conf = 0.0f;
@@ -518,18 +519,30 @@ void app_main(void) {
                                 ESP_LOGW(TAG, ">>> Cloud REJECTED (conf %.3f) — denying",
                                          cloud_conf);
                                 mqtt_ctrl_publish_event(MQTT_METHOD_FACE, matched_id, similarity, false);
-                                proceed = false;
+                                murky_denied = true;
                             } else {
                                 // Cloud unreachable — graceful degrade to a local
                                 // decision using the normal threshold.
                                 ESP_LOGW(TAG, ">>> Cloud unreachable — local fallback");
                                 proceed = (similarity > FACE_MATCH_THRESHOLD);
+                                if (!proceed) murky_denied = true;  // don't retry-hammer 8s timeouts
                             }
                         }
                         // similarity <= MODE3_LOW_THR -> proceed stays false (deny)
                     } else {
                         // Mode 3 disabled: original single-threshold behaviour.
                         proceed = (similarity > FACE_MATCH_THRESHOLD);
+                    }
+
+                    if (murky_denied) {
+                        // Without this rest, the very next scan re-detects the same
+                        // face, lands murky again, and fires another blocking cloud
+                        // round-trip every few seconds (seen live: calls at ~6s
+                        // intervals). Deny ONCE, rest, then resume scanning — the
+                        // same pattern every other deny path uses.
+                        cooldown_ms = UNLOCK_COOLDOWN_MS;
+                        cooldown_started_at_us = esp_timer_get_time();
+                        face_state = FACE_COOLDOWN;
                     }
 
                     if (proceed) {

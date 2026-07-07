@@ -1,11 +1,11 @@
 #include "cloud_verify_ctrl.h"
 
 #include <string.h>
-#include <stdlib.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
-#include "camera_ctrl.h"
+#include "face_ctrl.h"     // face_ctrl_get_last_jpeg — the murky-scored frame
 #include "wifi_config.h"   // VERIFIER_URL + VERIFIER_API_KEY (gitignored)
 
 static const char *TAG = "cloud_verify";
@@ -20,7 +20,11 @@ static const char *TAG = "cloud_verify";
 #define MP_BOUNDARY "----esp32smartlockboundary"
 
 // Accumulate the HTTP response body here so we can parse the JSON verdict.
-#define RESP_BUF_SIZE 512
+// 1KB: the /verify response carries a "quality" object (det_score, box dims,
+// num_faces) plus reason/detail strings — a 512B cap risked truncating valid
+// JSON, which json_bool() then failed to parse -> misread as "unreachable" ->
+// silent local fallback. 1KB comfortably holds the full response.
+#define RESP_BUF_SIZE 1024
 typedef struct {
     char   buf[RESP_BUF_SIZE];
     int    len;
@@ -43,30 +47,44 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 // Tiny JSON field extractors — the response is a small fixed-shape object like
 // {"match":true,"user_id":0,"confidence":0.7882,...}. A full JSON parser is
-// overkill; we scan for the keys we need.
-static bool json_bool(const char *json, const char *key, bool *out)
+// overkill; we scan for the keys we need. To avoid a key matching a SUBSTRING
+// of a longer key ("id" inside "user_id"), we only accept a match preceded by
+// a key boundary ('{' or ',', ignoring whitespace) — i.e. a real top-level key.
+static const char *find_key_value(const char *json, const char *key)
 {
     char pat[32];
-    snprintf(pat, sizeof(pat), "\"%s\":", key);
-    const char *p = strstr(json, pat);
-    if (!p) return false;
-    p += strlen(pat);
-    while (*p == ' ') p++;
-    if (strncmp(p, "true", 4) == 0)  { *out = true;  return true; }
-    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+    int n = snprintf(pat, sizeof(pat), "\"%s\":", key);
+    if (n <= 0 || n >= (int) sizeof(pat)) return NULL;
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        // Walk back over whitespace before the opening quote.
+        const char *b = p;
+        while (b > json && (b[-1] == ' ' || b[-1] == '\n' || b[-1] == '\t')) b--;
+        if (b == json || b[-1] == '{' || b[-1] == ',') {
+            const char *v = p + strlen(pat);
+            while (*v == ' ') v++;
+            return v;   // points at the value
+        }
+        p += strlen(pat);   // false hit inside a longer key — keep looking
+    }
+    return NULL;
+}
+
+static bool json_bool(const char *json, const char *key, bool *out)
+{
+    const char *v = find_key_value(json, key);
+    if (!v) return false;
+    if (strncmp(v, "true", 4) == 0)  { *out = true;  return true; }
+    if (strncmp(v, "false", 5) == 0) { *out = false; return true; }
     return false;
 }
 
 static bool json_number(const char *json, const char *key, float *out)
 {
-    char pat[32];
-    snprintf(pat, sizeof(pat), "\"%s\":", key);
-    const char *p = strstr(json, pat);
-    if (!p) return false;
-    p += strlen(pat);
-    while (*p == ' ') p++;
-    if (strncmp(p, "null", 4) == 0) return false;
-    *out = strtof(p, NULL);
+    const char *v = find_key_value(json, key);
+    if (!v) return false;
+    if (strncmp(v, "null", 4) == 0) return false;
+    *out = strtof(v, NULL);
     return true;
 }
 
@@ -76,16 +94,19 @@ cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
     if (out_user_id) *out_user_id = -1;
     if (out_confidence) *out_confidence = 0.0f;
 
-    // 1. Grab a HIGH-RES (VGA) frame — QVGA gives the cloud a face too small to
-    //    detect/recognise reliably. This momentarily switches the sensor to VGA.
-    camera_fb_t *fb = camera_ctrl_grab_highres();
-    if (!fb) {
-        ESP_LOGW(TAG, "no camera frame for cloud verify");
-        return CLOUD_VERIFY_UNREACHABLE;
-    }
-    if (fb->format != PIXFORMAT_JPEG) {
-        ESP_LOGW(TAG, "frame not JPEG (%d)", fb->format);
-        camera_ctrl_return_frame(fb);
+    // 1. Use the RETAINED frame — the exact JPEG the local recognizer just
+    //    scored in the murky band. Grabbing a fresh frame here was the old bug:
+    //    seconds later (worse with any camera reconfig) the user has moved, so
+    //    the cloud judged a DIFFERENT scene and kept answering no_face. The
+    //    retained frame is guaranteed to contain the face the local model saw.
+    //    No resolution switching: both VGA attempts failed (set_framesize left
+    //    QVGA-sized buffers -> truncated JPEGs; full reinit thrashed the camera
+    //    for ~2s per call) and a QVGA face crop (~110px) is already at ArcFace's
+    //    native 112x112 input size, so QVGA is sufficient for recognition.
+    const uint8_t *jpeg = NULL;
+    size_t jpeg_len = 0;
+    if (face_ctrl_get_last_jpeg(&jpeg, &jpeg_len) != ESP_OK) {
+        ESP_LOGW(TAG, "no retained frame for cloud verify");
         return CLOUD_VERIFY_UNREACHABLE;
     }
 
@@ -97,18 +118,19 @@ cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
     const char *trailer = "\r\n--" MP_BOUNDARY "--\r\n";
     size_t hdr_len = strlen(hdr_fmt);
     size_t trl_len = strlen(trailer);
-    size_t body_len = hdr_len + fb->len + trl_len;
+    size_t body_len = hdr_len + jpeg_len + trl_len;
 
-    char *body = malloc(body_len);
+    // PSRAM, not malloc(): a ~15KB body would otherwise land in the scarce
+    // internal heap (allocations under SPIRAM_MALLOC_ALWAYSINTERNAL=16KB are
+    // forced internal), and internal RAM is the tightest resource on this build.
+    char *body = heap_caps_malloc(body_len, MALLOC_CAP_SPIRAM);
     if (!body) {
         ESP_LOGE(TAG, "OOM building multipart body (%u bytes)", (unsigned) body_len);
-        camera_ctrl_return_frame(fb);
         return CLOUD_VERIFY_UNREACHABLE;
     }
     memcpy(body, hdr_fmt, hdr_len);
-    memcpy(body + hdr_len, fb->buf, fb->len);
-    memcpy(body + hdr_len + fb->len, trailer, trl_len);
-    camera_ctrl_return_frame(fb);   // frame copied into body; release it
+    memcpy(body + hdr_len, jpeg, jpeg_len);
+    memcpy(body + hdr_len + jpeg_len, trailer, trl_len);
 
     // 3. POST to the verifier.
     resp_accum_t acc = { .len = 0 };
@@ -121,7 +143,7 @@ cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
-        free(body);
+        heap_caps_free(body);
         return CLOUD_VERIFY_UNREACHABLE;
     }
     esp_http_client_set_header(client, "Content-Type",
@@ -132,7 +154,7 @@ cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
-    free(body);
+    heap_caps_free(body);
 
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "cloud verify HTTP failed: %s — falling back locally",

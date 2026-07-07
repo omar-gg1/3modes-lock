@@ -18,11 +18,3 @@ camera_fb_t *camera_ctrl_get_frame(void);
  * Return a frame buffer back to the driver. ALWAYS call after get_frame.
  */
 void camera_ctrl_return_frame(camera_fb_t *fb);
-
-/**
- * Grab ONE higher-resolution (VGA 640x480) JPEG frame for the Mode 3 cloud
- * verifier, which needs a bigger face than QVGA provides. Temporarily switches
- * the sensor to VGA and back to QVGA (the local recognizer's size). Caller MUST
- * camera_ctrl_return_frame() the result.
- */
-camera_fb_t *camera_ctrl_grab_highres(void);

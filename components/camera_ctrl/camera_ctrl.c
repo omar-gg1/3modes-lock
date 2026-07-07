@@ -21,6 +21,26 @@
 
 static const char *TAG = "camera_ctrl";
 
+// The camera runs QVGA-only, permanently. Runtime resolution switching for the
+// Mode 3 cloud grab was tried twice and abandoned:
+//   1. sensor->set_framesize(VGA): cam_hal's frame buffers are sized ONCE at
+//      esp_camera_init() (QVGA -> 15360 B/buffer), so VGA JPEGs (40-80KB at
+//      q10) truncated into them -> FB-OVF floods + corrupt frames the cloud
+//      called "no_face".
+//   2. Full esp_camera_deinit()/init() at VGA: correct buffers, but ~2s of
+//      camera teardown per cloud call, and by then the user had moved anyway.
+// The real fix lives in face_ctrl: it RETAINS the JPEG of the frame the local
+// recognizer actually scored, and cloud_verify sends that — same scene, no
+// reconfig. A QVGA face crop (~110px) is already ArcFace's native input size.
+
+static void apply_orientation_fix(void) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (s != NULL) {
+        s->set_vflip(s, 1);
+        s->set_hmirror(s, 1);
+    }
+}
+
 esp_err_t camera_ctrl_init(void) {
     camera_config_t config = {
         .pin_pwdn = CAM_PIN_PWDN,
@@ -43,22 +63,18 @@ esp_err_t camera_ctrl_init(void) {
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        // QVGA (320x240) is the LOCAL recognizer's expected input (face_ctrl
-        // decodes into a fixed 320x240 buffer). For Mode 3 the cloud needs a
-        // bigger face, so camera_ctrl_grab_highres() temporarily switches the
-        // sensor to VGA for a single frame — see below. Base stays QVGA.
-        .frame_size = FRAMESIZE_QVGA,    // 320x240 — local recognizer input
-        // jpeg_quality: LOWER number = BETTER quality (less compression). 10 gives
-        // the recognizer cleaner pixels than the old 15, which raises and steadies
-        // similarity scores. The recognizer is the consumer, not a human eye, so
-        // we trade a little bandwidth for fidelity.
-        .jpeg_quality = 10,
-        // fb_count = 2: double-buffering. With 1 buffer the camera DMA and the
-        // JPEG decoder fight over the same memory — the decoder reads a frame the
-        // camera is mid-writing, giving corrupt JPEGs (NO-SOI / jpeg_dec -3) and
-        // occasional crashes. With 3+ buffers stale frames pile up (FB-OVF). Two
-        // buffers + GRAB_LATEST is the sweet spot: one fills while one is read,
-        // and we always get the freshest completed frame.
+        // VGA (640x480), captured permanently. Two consumers, decoupled:
+        //   - LOCAL recognizer: face_ctrl downscales this VGA JPEG to its
+        //     320x240 working buffer, so the local pipeline is UNCHANGED (same
+        //     scores, no re-enrollment) — it just feeds off a bigger source.
+        //   - Mode 3 CLOUD verify: gets the full VGA JPEG (retained by
+        //     face_ctrl), giving ArcFace's detector a ~200px face it can lock
+        //     onto (QVGA's ~90px face was below its detection floor).
+        // No runtime resolution switching (that thrashed the camera); one size.
+        .frame_size = FRAMESIZE_VGA,
+        // Slightly less compression than QVGA's 10: a VGA frame has the bandwidth
+        // budget, and more detail helps the cloud detector. Lower = better.
+        .jpeg_quality = 12,
         .fb_count = 2,
         .fb_location = CAMERA_FB_IN_PSRAM,
         .grab_mode = CAMERA_GRAB_LATEST,
@@ -70,15 +86,9 @@ esp_err_t camera_ctrl_init(void) {
         return err;
     }
 
-    // Fix upside-down sensor mounting on this clone
-    sensor_t *s = esp_camera_sensor_get();
-    if (s != NULL) {
-        s->set_vflip(s, 1);
-        s->set_hmirror(s, 1);
-        ESP_LOGI(TAG, "Sensor orientation: vflip=1, hmirror=1");
-    }
-
-    ESP_LOGI(TAG, "Camera initialized (QVGA JPEG)");
+    apply_orientation_fix();
+    ESP_LOGI(TAG, "Sensor orientation: vflip=1, hmirror=1");
+    ESP_LOGI(TAG, "Camera initialized (VGA JPEG)");
     return ESP_OK;
 }
 
@@ -90,30 +100,3 @@ void camera_ctrl_return_frame(camera_fb_t *fb) {
     if (fb) esp_camera_fb_return(fb);
 }
 
-camera_fb_t *camera_ctrl_grab_highres(void) {
-    // Temporarily raise the sensor to VGA (640x480) for ONE frame so the cloud
-    // verifier gets a large enough face, then restore QVGA for the local
-    // recognizer. The local pipeline decodes a fixed 320x240 buffer, so the base
-    // resolution must stay QVGA; only this one-off cloud grab is bigger.
-    sensor_t *s = esp_camera_sensor_get();
-    if (s == NULL) {
-        return esp_camera_fb_get();   // fall back to whatever size we're at
-    }
-    s->set_framesize(s, FRAMESIZE_VGA);
-    // Drain a couple of frames so the new (bigger) size actually flushes through
-    // the DMA buffers — the first frame(s) after a size change can be the old
-    // size or partial.
-    for (int i = 0; i < 2; i++) {
-        camera_fb_t *drop = esp_camera_fb_get();
-        if (drop) esp_camera_fb_return(drop);
-    }
-    camera_fb_t *fb = esp_camera_fb_get();   // the real VGA frame
-    // Restore QVGA for local recognition and drain again so the next local
-    // detect gets a proper 320x240 frame.
-    s->set_framesize(s, FRAMESIZE_QVGA);
-    for (int i = 0; i < 2; i++) {
-        camera_fb_t *drop = esp_camera_fb_get();
-        if (drop) esp_camera_fb_return(drop);
-    }
-    return fb;
-}

@@ -107,6 +107,17 @@ static const int FRAME_W = 320;
 static const int FRAME_H = 240;
 static const size_t RGB_BUF_SIZE = FRAME_W * FRAME_H * 3;
 
+// ---- Retained JPEG of the last processed frame (Mode 3 cloud verify) ----
+// When local recognition scores in the murky band, the cloud verifier must see
+// the EXACT frame that produced that score — not a fresh frame grabbed seconds
+// later (the user has moved by then; that temporal mismatch is why cloud verify
+// kept returning no_face). We keep a copy of every good frame's JPEG here;
+// detect_once() returning true guarantees this buffer holds the detected frame.
+// VGA @ quality 12 is ~30-60KB, so a 96KB cap covers it with margin. PSRAM.
+static uint8_t *s_last_jpeg = nullptr;
+static size_t   s_last_jpeg_len = 0;
+static const size_t LAST_JPEG_CAP = 96 * 1024;
+
 // ---- Recognition quality gate (CALIBRATE with real data) ----
 // Only recognize/enroll from detections that clear these bars. Gating out small
 // or low-confidence faces is what keeps similarity scores high and consistent.
@@ -244,6 +255,13 @@ extern "C" esp_err_t face_ctrl_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    // Retained-JPEG buffer for Mode 3 cloud verify (PSRAM — plenty free there).
+    s_last_jpeg = (uint8_t *) heap_caps_malloc(LAST_JPEG_CAP, MALLOC_CAP_SPIRAM);
+    if (s_last_jpeg == nullptr) {
+        // Non-fatal: local recognition still works; only cloud verify degrades.
+        ESP_LOGW(TAG, "no PSRAM for retained JPEG — cloud verify unavailable");
+    }
+
     s_detector = new HumanFaceDetect();
     if (s_detector == nullptr) {
         ESP_LOGE(TAG, "failed to allocate HumanFaceDetect");
@@ -274,6 +292,15 @@ static esp_err_t decode_jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_len)
     jpeg_dec_config_t cfg = {};
     cfg.output_type = JPEG_PIXEL_FORMAT_RGB888;
     cfg.rotate = JPEG_ROTATE_0D;
+    // The camera now captures VGA (640x480) so the cloud verifier gets a big
+    // enough face, but the LOCAL recognizer still wants 320x240. Scale DURING
+    // decode: VGA -> 320x240 (both multiples of 8, required by esp_jpeg). This
+    // keeps the local pipeline byte-for-byte identical to the old QVGA path —
+    // same buffer size, same detector input — while the retained JPEG stays
+    // full VGA for the cloud. If a QVGA frame ever arrives (unchanged sensors),
+    // scaling to the same size is a harmless no-op.
+    cfg.scale.width = FRAME_W;    // 320
+    cfg.scale.height = FRAME_H;   // 240
 
     jpeg_dec_handle_t dec = nullptr;
     jpeg_error_t err = jpeg_dec_open(&cfg, &dec);
@@ -295,9 +322,12 @@ static esp_err_t decode_jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_len)
         return ESP_FAIL;
     }
 
-    if (header.width != FRAME_W || header.height != FRAME_H) {
-        ESP_LOGW(TAG, "unexpected JPEG dims %dx%d, expected %dx%d",
-                 header.width, header.height, FRAME_W, FRAME_H);
+    // Accept the expected source sizes: VGA (the new default, scaled to 320x240
+    // above) or QVGA (already 320x240). Reject anything unexpected.
+    bool ok_dims = (header.width == 640 && header.height == 480) ||
+                   (header.width == FRAME_W && header.height == FRAME_H);
+    if (!ok_dims) {
+        ESP_LOGW(TAG, "unexpected JPEG dims %dx%d", header.width, header.height);
         jpeg_dec_close(dec);
         return ESP_FAIL;
     }
@@ -333,6 +363,14 @@ extern "C" bool face_ctrl_detect_once(void)
         esp_camera_fb_return(fb);
         s_last_detect_fail = DETECT_FAIL_BAD_JPEG;
         return false;
+    }
+
+    // Retain a copy of this frame's JPEG (must happen while fb is valid). If
+    // detection below succeeds, this copy IS the detected frame — exactly what
+    // Mode 3 cloud verify needs to judge the same image the local model scored.
+    if (s_last_jpeg != nullptr && fb->len <= LAST_JPEG_CAP) {
+        memcpy(s_last_jpeg, fb->buf, fb->len);
+        s_last_jpeg_len = fb->len;
     }
 
     esp_err_t decode_err = decode_jpeg_to_rgb(fb->buf, fb->len);
@@ -531,6 +569,19 @@ extern "C" esp_err_t face_ctrl_recognize(int *out_id, float *out_similarity)
     }
     *out_id = user_id;
     *out_similarity = top.similarity;
+    return ESP_OK;
+}
+
+extern "C" esp_err_t face_ctrl_get_last_jpeg(const uint8_t **out_buf, size_t *out_len)
+{
+    if (out_buf == nullptr || out_len == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_last_jpeg == nullptr || s_last_jpeg_len == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *out_buf = s_last_jpeg;
+    *out_len = s_last_jpeg_len;
     return ESP_OK;
 }
 

@@ -71,6 +71,19 @@ bool face_ctrl_last_is_good_quality(void);
 int face_ctrl_last_detect_fail(void);
 
 /**
+ * @brief Borrow the JPEG of the most recent frame processed by
+ *        face_ctrl_detect_once(). When detect_once() returned true, this is the
+ *        EXACT frame the detector/recognizer just scored — what the Mode 3
+ *        cloud verifier must judge (a fresh grab seconds later would show a
+ *        different scene). The pointer stays valid until the next detect_once().
+ *
+ * @param out_buf  Receives a pointer to the internal JPEG buffer (do not free).
+ * @param out_len  Receives the JPEG length in bytes.
+ * @return ESP_OK, or ESP_ERR_NOT_FOUND if no frame has been retained yet.
+ */
+esp_err_t face_ctrl_get_last_jpeg(const uint8_t **out_buf, size_t *out_len);
+
+/**
  * @brief Check whether the most recently detected face matches an enrolled one.
  *        Must be called immediately after face_ctrl_detect_once() returned true.
  *
