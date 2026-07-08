@@ -78,10 +78,23 @@ esp_err_t camera_ctrl_init(void) {
         //     onto (QVGA's ~90px face was below its detection floor).
         // No runtime resolution switching (that thrashed the camera); one size.
         .frame_size = FRAMESIZE_VGA,
-        // Slightly less compression than QVGA's 10: a VGA frame has the bandwidth
-        // budget, and more detail helps the cloud detector. Lower = better.
-        .jpeg_quality = 12,
-        .fb_count = 2,
+        // jpeg_quality 16 (higher number = MORE compression = smaller files).
+        // The camera's VGA frame buffer is ~61KB; at q12 a well-lit close face
+        // produced JPEGs that OVERFLOWED it -> truncated frames with no end
+        // marker (cam_hal "NO-EOI"/"DMA overflow", raw ROM printfs we can't
+        // silence). Worse, the flood was starving the face task of frames
+        // (liveness no_frame timeouts). q16 keeps every frame comfortably under
+        // the buffer while ArcFace still had huge margin at q12 (det_score
+        // 0.80-0.88 vs its ~0.5 floor), so the small quality drop is invisible
+        // to recognition. Fixing the overflow at the source is the ONLY way to
+        // stop the messages — they bypass the log system entirely.
+        .jpeg_quality = 16,
+        // 3 buffers (not 2): the face task PAUSES during the post-unlock cooldown
+        // and liveness processing, so nobody drains frames for a stretch. With
+        // only 2 VGA buffers the DMA overruns immediately -> a "cam_hal: FB-OVF"
+        // flood. A third buffer absorbs those pauses so the DMA always has a free
+        // slot to write into. Costs one more ~60KB PSRAM buffer (we have 7.9MB).
+        .fb_count = 3,
         .fb_location = CAMERA_FB_IN_PSRAM,
         .grab_mode = CAMERA_GRAB_LATEST,
     };
@@ -93,6 +106,17 @@ esp_err_t camera_ctrl_init(void) {
     }
 
     apply_orientation_fix();
+
+    // Silence the camera HAL's frame-drop spam. "cam_hal: FB-OVF" (buffer
+    // overflow while the face task is paused) and "NO-SOI/NO-EOI" (a torn grab)
+    // are EXPECTED and harmless here — fb_count=3 minimizes them and our JPEG
+    // integrity gate discards any torn frame — but cam_hal logs each one, which
+    // floods the monitor. Raise cam_hal's threshold to ERROR so those drop out
+    // while genuine camera errors still surface. Our own logs are unaffected.
+    esp_log_level_set("cam_hal", ESP_LOG_ERROR);
+    esp_log_level_set("s3 ll_cam", ESP_LOG_ERROR);
+    esp_log_level_set("JPEG_DEC", ESP_LOG_NONE);   // torn-frame segment errors
+
     ESP_LOGI(TAG, "Sensor orientation: vflip=0, hmirror=0 (upright)");
     ESP_LOGI(TAG, "Camera initialized (VGA JPEG)");
     return ESP_OK;

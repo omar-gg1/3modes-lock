@@ -11,7 +11,6 @@
 #include "camera_ctrl.h"
 #include "keypad_ctrl.h"
 #include "wifi_ctrl.h"
-#include "debug_server.h"
 #include "crypto_ctrl.h"
 #include "liveness_ctrl.h"
 #include "mqtt_ctrl.h"
@@ -190,16 +189,6 @@ void app_main(void) {
     if (ENABLE_BUTTON) button_ctrl_init();
     if (ENABLE_KEYPAD) keypad_ctrl_init();
     if (ENABLE_CAMERA) camera_ctrl_init();
-
-    // Diagnostic camera web server: /capture (single JPEG) + /stream (live view)
-    // at http://<device-ip>/. Lets us SEE exactly what the camera captures — the
-    // ground truth for why the cloud's ArcFace rejects enrollment frames (too
-    // small? dark? torn?). Only started when online. /stream shares the camera
-    // with the face task; use /capture for a clean single grab.
-    if (wifi_up && ENABLE_CAMERA) {
-        debug_server_start();
-    }
-
     if (ENABLE_FACE)   face_ctrl_init();
 
     // Mode 3 provisioning: with WiFi up, push the locally-enrolled faces to the

@@ -406,7 +406,8 @@ static esp_err_t decode_jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_len)
     jpeg_dec_header_info_t header = {};
     err = jpeg_dec_parse_header(dec, &io, &header);
     if (err != JPEG_ERR_OK) {
-        ESP_LOGE(TAG, "jpeg_dec_parse_header failed: %d", err);
+        // Same torn-frame case as below — DEBUG so it doesn't flood the monitor.
+        ESP_LOGD(TAG, "jpeg_dec_parse_header failed: %d (skipping torn frame)", err);
         jpeg_dec_close(dec);
         return ESP_FAIL;
     }
@@ -423,7 +424,11 @@ static esp_err_t decode_jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_len)
 
     err = jpeg_dec_process(dec, &io);
     if (err != JPEG_ERR_OK) {
-        ESP_LOGE(TAG, "jpeg_dec_process failed: %d", err);
+        // A torn frame that passed the SOI/EOI gate but is internally corrupt
+        // (valid start/end markers, damaged middle). Harmless — we just skip it
+        // and the next grab is whole — but at ERROR level it floods the monitor.
+        // DEBUG so it's available when wanted but silent in normal operation.
+        ESP_LOGD(TAG, "jpeg_dec_process failed: %d (skipping torn frame)", err);
         jpeg_dec_close(dec);
         return ESP_FAIL;
     }

@@ -26,3 +26,31 @@ CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
 
 # Keep Wi-Fi/LWIP in internal RAM (PSRAM Wi-Fi DMA is unsafe on this module).
 # CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
+
+# --- Camera: keep PSRAM DMA mode OFF (tried 2026-07-08, caused a regression). ---
+# In PSRAM DMA mode, cam_take() VALIDATES the JPEG itself and silently drops torn
+# frames, LOOPING inside esp_camera_fb_get() (FB_GET_TIMEOUT=4s) until a complete
+# frame arrives. During esp-dl inference (PSRAM bus saturated) torn frames spike,
+# so every murky/liveness cycle stalled the main loop for seconds — the polled
+# BOOT button needed 3+ presses and liveness died with no_frame timeouts. In
+# non-PSRAM mode torn frames are returned IMMEDIATELY and face_ctrl's SOI/EOI
+# gate rejects them in microseconds — loop stays responsive. Torn-frame rate is
+# minimized instead by jpeg_quality=16 + fb_count=3 (camera_ctrl.c) and the
+# FB-OVF/NO-EOI printf noise is silenced in cam_hal.c (see LOCAL_PATCHES.md).
+# CONFIG_CAMERA_PSRAM_DMA is not set
+
+# --- Wi-Fi/PHY boot-crash mitigations (keep these; regen must not drop them). ---
+# WiFi code in IRAM so it doesn't run from flash cache during a PHY-cal flash
+# write (the "Cache disabled..." 0x42feff04 crash). See known-followups #4.
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
+# 40MHz flash: widens the cache-disable timing margin on this Boya clone chip.
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+# THE root-cause fix for the boot crash: don't store PHY RF calibration in NVS.
+# The stored blob kept failing its checksum, so every boot did a full recal AND
+# a flash write-back ("Saving new calibration data...") — and THAT flash write,
+# racing WiFi code, is what disabled the cache mid-execution -> 0x42feff04. With
+# storage OFF the PHY calibrates fresh into RAM each boot: costs ~50ms extra at
+# startup, writes NOTHING to flash, so the race window never opens. A door lock
+# doesn't care about the tiny recal cost.
+# CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE is not set
