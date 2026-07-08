@@ -126,8 +126,15 @@ static const size_t LAST_JPEG_CAP = 96 * 1024;
 // and time out (which is what happened on the first hardware test).
 static const float FACE_MIN_DETECT_SCORE      = 0.80f;  // live recognition
 static const float FACE_MIN_BOX_FRAC          = 0.25f;
-static const float FACE_ENROLL_MIN_SCORE      = 0.70f;  // enrollment (relaxed)
-static const float FACE_ENROLL_MIN_BOX_FRAC   = 0.18f;
+// Enrollment gate. Raised so every SAVED frame is one the cloud's ArcFace
+// detector will also accept — the ESP's own detector is looser than RetinaFace,
+// and marginal frames that passed here (box ~0.18) were being rejected by the
+// cloud with 422 "no_face" during Mode 3 sync. box_frac 0.28 of the 320px local
+// frame ≈ a 90px local face ≈ a ~180px face on the retained VGA JPEG the cloud
+// sees — comfortably above RetinaFace's detection floor. score 0.75 filters
+// blurry/angled grabs. Net effect: fewer, cleaner samples that BOTH sides accept.
+static const float FACE_ENROLL_MIN_SCORE      = 0.75f;
+static const float FACE_ENROLL_MIN_BOX_FRAC   = 0.28f;
 
 // Pace the enrollment capture loop. 50ms = ~20 attempts/sec: enough to gather
 // samples quickly, but not the 30ms hammer that out-ran the camera, nor the
@@ -147,7 +154,15 @@ static bool last_detection_passes(float min_score, float min_box_frac)
     }
     int w = f.box[2] - f.box[0];
     int h = f.box[3] - f.box[1];
-    if (w < (FRAME_W * min_box_frac) || h < (FRAME_H * min_box_frac)) {
+    // Gate on the box's SHORTER side against a single pixel floor (local 320x240
+    // frame). Using FRAME_W for width but FRAME_H for height made the width gate
+    // stricter than the height gate — a face 87px wide / 111px tall (a clean,
+    // score-0.98 detection!) failed on width by 2px while passing height easily.
+    // A single min_box_frac * FRAME_W floor on min(w,h) treats both dimensions
+    // the same. This local pixel count doubles on the retained VGA frame the
+    // cloud sees, so a bigger floor here => a bigger face for ArcFace's detector.
+    int shorter = (w < h) ? w : h;
+    if (shorter < (int)(FRAME_W * min_box_frac)) {
         return false;
     }
     return true;
@@ -177,6 +192,80 @@ static void persist_encrypted_db(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "failed to re-encrypt face DB: %s", esp_err_to_name(err));
     }
+}
+
+// ---- Enrollment JPEGs, kept for Mode 3 cloud sync -------------------------
+// The cloud verifier (ArcFace) cannot use the ESP's esp-dl embeddings — the two
+// models are different, so their 512-d vectors are incompatible. To enroll the
+// SAME face on the cloud, it must re-embed the actual enrollment IMAGES with its
+// own ArcFace. So during local enrollment we also persist each gate-passed VGA
+// JPEG (encrypted, like the DB). On a Mode 3 boot the sync layer decrypts these
+// and POSTs them to /enroll, giving both sides one face from one camera.
+//   /spiffs/enroll_NN.jpg.enc  (NN = 00..MAX_ENROLL_IMAGES-1)
+// These are ONLY written during enrollment and ONLY read when Mode 3 syncs;
+// local-only modes never touch the cloud, honouring the privacy boundary.
+#define MAX_ENROLL_IMAGES 8
+static int s_enroll_img_count = 0;   // how many were saved this enrollment
+
+static void enroll_img_enc_path(int idx, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "/spiffs/enroll_%02d.jpg.enc", idx);
+}
+
+// Wipe any enrollment images from a previous enrollment so a fresh enroll is a
+// clean set (mirrors clear_all_feats() on the DB). Called at enroll start.
+// Only remove() files that actually EXIST: an unconditional remove() on a
+// missing path still forces SPIFFS to scan its object table, and 8 such scans
+// back-to-back at 40MHz flash starved the idle task -> task_wdt timeout. A
+// cheap fopen() existence check skips the misses, and we yield so the idle task
+// (and thus the watchdog) always gets serviced.
+static void enroll_imgs_clear(void)
+{
+    char p[48];
+    for (int i = 0; i < MAX_ENROLL_IMAGES; i++) {
+        enroll_img_enc_path(i, p, sizeof(p));
+        FILE *f = fopen(p, "rb");
+        if (f != nullptr) {
+            fclose(f);
+            remove(p);
+        }
+        vTaskDelay(1);   // let IDLE/watchdog run between flash ops
+    }
+    s_enroll_img_count = 0;
+}
+
+// Persist one gate-passed enrollment JPEG as the next encrypted enroll image.
+// Writes plaintext to a temp path, encrypts to enroll_NN.jpg.enc, removes the
+// plaintext. Best-effort: a failure here must not abort enrollment (the local
+// DB is the primary; cloud sync is a bonus), so we log and move on.
+static void enroll_img_save(const uint8_t *jpeg, size_t len)
+{
+    if (jpeg == nullptr || len == 0 || s_enroll_img_count >= MAX_ENROLL_IMAGES) {
+        return;
+    }
+    const char *tmp = "/spiffs/enroll_tmp.jpg";
+    FILE *f = fopen(tmp, "wb");
+    if (f == nullptr) {
+        ESP_LOGW(TAG, "  enroll-img: cannot open temp file (skipping cloud copy)");
+        return;
+    }
+    size_t wrote = fwrite(jpeg, 1, len, f);
+    fclose(f);
+    if (wrote != len) {
+        ESP_LOGW(TAG, "  enroll-img: short write %u/%u (skipping cloud copy)",
+                 (unsigned) wrote, (unsigned) len);
+        remove(tmp);
+        return;
+    }
+    char enc[48];
+    enroll_img_enc_path(s_enroll_img_count, enc, sizeof(enc));
+    esp_err_t err = crypto_ctrl_encrypt_file(tmp, enc);
+    remove(tmp);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "  enroll-img: encrypt failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_enroll_img_count++;
 }
 
 // Mount the "models" SPIFFS partition at /spiffs.
@@ -365,7 +454,26 @@ extern "C" bool face_ctrl_detect_once(void)
         return false;
     }
 
-    // Retain a copy of this frame's JPEG (must happen while fb is valid). If
+    // INTEGRITY GATE — check ONCE, up front. At VGA the camera's
+    // CAMERA_GRAB_LATEST can hand back a buffer still mid-DMA-write: a truncated
+    // JPEG with no end-of-image marker (cam_hal logs "NO-EOI"/"NO-SOI"). Such a
+    // frame can never decode — feeding it to jpeg_dec_process just spends CPU and
+    // emits "jpeg_dec_process failed: -3" every scan. A valid JPEG starts with
+    // SOI (FF D8) and ends with EOI (FF D9); if either is missing, skip this
+    // frame entirely (no retain, no decode) and try the next one. This both
+    // silences the -3 flood AND guarantees the retained frame the cloud verifies
+    // is a complete image.
+    bool complete_jpeg =
+        fb->len >= 4 &&
+        fb->buf[0] == 0xFF && fb->buf[1] == 0xD8 &&
+        fb->buf[fb->len - 2] == 0xFF && fb->buf[fb->len - 1] == 0xD9;
+    if (!complete_jpeg) {
+        esp_camera_fb_return(fb);
+        s_last_detect_fail = DETECT_FAIL_BAD_JPEG;
+        return false;   // truncated grab; next frame will be whole
+    }
+
+    // Retain a copy of this (complete) frame's JPEG while fb is valid. If
     // detection below succeeds, this copy IS the detected frame — exactly what
     // Mode 3 cloud verify needs to judge the same image the local model scored.
     if (s_last_jpeg != nullptr && fb->len <= LAST_JPEG_CAP) {
@@ -464,6 +572,7 @@ extern "C" esp_err_t face_ctrl_enroll_multi(int id, int samples_wanted, int time
     // delete only the target user's features instead of clearing everything.
     s_recognizer->clear_all_feats();
     featmap_reset();  // feature ids restart at 1 after a clear
+    enroll_imgs_clear();  // drop previous enrollment's cloud-sync JPEGs too
 
     int captured = 0;
     int64_t start_us = esp_timer_get_time();
@@ -516,6 +625,11 @@ extern "C" esp_err_t face_ctrl_enroll_multi(int id, int samples_wanted, int time
 
         dl::image::img_t img = build_img();
         s_recognizer->enroll(img, s_last_results);
+        // Persist this exact gate-passed VGA frame for Mode 3 cloud sync. It's a
+        // complete JPEG (detect_once only retains frames with a valid EOI) and
+        // it's the same look we just embedded locally — so the cloud enrolls the
+        // identical face from the identical camera. Best-effort; never fatal.
+        enroll_img_save(s_last_jpeg, s_last_jpeg_len);
         captured++;
         // The recognizer just assigned this feature the id == s_feat_count+1
         // (sequential after the clear). Record that it belongs to this user.
@@ -583,6 +697,36 @@ extern "C" esp_err_t face_ctrl_get_last_jpeg(const uint8_t **out_buf, size_t *ou
     *out_buf = s_last_jpeg;
     *out_len = s_last_jpeg_len;
     return ESP_OK;
+}
+
+extern "C" int face_ctrl_enroll_image_count(void)
+{
+    // Scan flash rather than trust s_enroll_img_count: after a reboot the counter
+    // resets to 0 but the encrypted images persist, and Mode 3 sync runs post-boot.
+    // Count the contiguous run of enroll_NN.jpg.enc from 0.
+    int n = 0;
+    char p[48];
+    for (int i = 0; i < MAX_ENROLL_IMAGES; i++) {
+        enroll_img_enc_path(i, p, sizeof(p));
+        FILE *f = fopen(p, "rb");
+        if (f == nullptr) break;   // first gap ends the set
+        fclose(f);
+        n++;
+    }
+    return n;
+}
+
+extern "C" esp_err_t face_ctrl_enroll_image_decrypt(int idx, const char *out_path)
+{
+    if (out_path == nullptr || idx < 0 || idx >= MAX_ENROLL_IMAGES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char enc[48];
+    enroll_img_enc_path(idx, enc, sizeof(enc));
+    FILE *f = fopen(enc, "rb");
+    if (f == nullptr) return ESP_ERR_NOT_FOUND;
+    fclose(f);
+    return crypto_ctrl_decrypt_file(enc, out_path);
 }
 
 extern "C" int face_ctrl_last_detect_fail(void)

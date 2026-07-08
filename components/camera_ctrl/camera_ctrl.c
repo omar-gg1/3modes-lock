@@ -36,8 +36,14 @@ static const char *TAG = "camera_ctrl";
 static void apply_orientation_fix(void) {
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
-        s->set_vflip(s, 1);
-        s->set_hmirror(s, 1);
+        // The camera is mounted rotated 180° relative to the sensor's native
+        // orientation. vflip=1+hmirror=1 was producing an UPSIDE-DOWN image,
+        // which the cloud's ArcFace/RetinaFace (trained on upright faces) could
+        // not detect at all -> every Mode 3 sync frame came back "no_face",
+        // even though the local esp-dl detector (more rotation-tolerant) matched.
+        // Both flips OFF gives the correct upright image for the physical mount.
+        s->set_vflip(s, 0);
+        s->set_hmirror(s, 0);
     }
 }
 
@@ -87,7 +93,7 @@ esp_err_t camera_ctrl_init(void) {
     }
 
     apply_orientation_fix();
-    ESP_LOGI(TAG, "Sensor orientation: vflip=1, hmirror=1");
+    ESP_LOGI(TAG, "Sensor orientation: vflip=0, hmirror=0 (upright)");
     ESP_LOGI(TAG, "Camera initialized (VGA JPEG)");
     return ESP_OK;
 }

@@ -1,19 +1,29 @@
 #include "cloud_verify_ctrl.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
-#include "face_ctrl.h"     // face_ctrl_get_last_jpeg — the murky-scored frame
+#include "face_ctrl.h"     // retained murky frame + enrollment images for sync
 #include "wifi_config.h"   // VERIFIER_URL + VERIFIER_API_KEY (gitignored)
 
 static const char *TAG = "cloud_verify";
 
-// Bounded HTTP timeout: the murky-case round-trip (upload frame + ArcFace
-// inference + response) must not hang the lock. If it exceeds this we treat the
-// cloud as unreachable and fall back locally.
-#define CLOUD_HTTP_TIMEOUT_MS 8000
+// Two timeouts, because the two calls have very different latency budgets:
+//
+// VERIFY (murky-band, gates the lock): must NOT hang the door. 8s is plenty for
+// a warm model and keeps a stalled cloud from freezing the user; if it exceeds
+// this we treat the cloud as unreachable and fall back locally.
+#define CLOUD_VERIFY_TIMEOUT_MS 8000
+//
+// ENROLL (one-time Mode 3 boot sync): the FIRST inference after the verifier
+// container (re)starts pays a cold-start cost — ArcFace loads its weights and
+// JITs the graph, which on a small instance can take 15-20s. This is a
+// background provisioning step the user isn't waiting on a door for, so give it
+// a generous timeout instead of failing with EAGAIN mid-warm-up.
+#define CLOUD_ENROLL_TIMEOUT_MS 30000
 
 // Multipart/form-data pieces. The verifier's /verify expects a form field named
 // "image" containing the JPEG.
@@ -137,7 +147,7 @@ cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
     esp_http_client_config_t cfg = {
         .url = VERIFIER_URL "/verify",
         .method = HTTP_METHOD_POST,
-        .timeout_ms = CLOUD_HTTP_TIMEOUT_MS,
+        .timeout_ms = CLOUD_VERIFY_TIMEOUT_MS,
         .event_handler = http_event_handler,
         .user_data = &acc,
     };
@@ -187,4 +197,138 @@ cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
     }
     ESP_LOGI(TAG, "cloud NO_MATCH confidence=%.3f", conf);
     return CLOUD_VERIFY_NO_MATCH;
+}
+
+// ---- Mode 3 enrollment sync (local faces -> cloud /enroll) -----------------
+
+// POST one JPEG (already in a heap buffer) to /enroll as multipart form-data
+// with the three fields the endpoint requires: user_id, name, image. Returns
+// true iff the server answered 200 (it enrolled the face). Text form fields are
+// emitted as their own multipart parts before the file part.
+static bool post_enroll_image(int user_id, const char *name,
+                              const uint8_t *jpeg, size_t jpeg_len)
+{
+    // Build the field parts. Keep them small and fixed-shape; the JPEG dominates.
+    char fields[512];
+    int fld = snprintf(fields, sizeof(fields),
+        "--" MP_BOUNDARY "\r\n"
+        "Content-Disposition: form-data; name=\"user_id\"\r\n\r\n%d\r\n"
+        "--" MP_BOUNDARY "\r\n"
+        "Content-Disposition: form-data; name=\"name\"\r\n\r\n%s\r\n"
+        "--" MP_BOUNDARY "\r\n"
+        "Content-Disposition: form-data; name=\"source\"\r\n\r\nesp32\r\n"
+        "--" MP_BOUNDARY "\r\n"
+        "Content-Disposition: form-data; name=\"image\"; filename=\"enroll.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n\r\n",
+        user_id, name);
+    if (fld <= 0 || fld >= (int) sizeof(fields)) return false;
+
+    const char *trailer = "\r\n--" MP_BOUNDARY "--\r\n";
+    size_t trl_len = strlen(trailer);
+    size_t body_len = (size_t) fld + jpeg_len + trl_len;
+
+    char *body = heap_caps_malloc(body_len, MALLOC_CAP_SPIRAM);
+    if (!body) {
+        ESP_LOGE(TAG, "OOM building enroll body (%u bytes)", (unsigned) body_len);
+        return false;
+    }
+    memcpy(body, fields, fld);
+    memcpy(body + fld, jpeg, jpeg_len);
+    memcpy(body + fld + jpeg_len, trailer, trl_len);
+
+    resp_accum_t acc = { .len = 0 };
+    esp_http_client_config_t cfg = {
+        .url = VERIFIER_URL "/enroll",
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = CLOUD_ENROLL_TIMEOUT_MS,   // tolerate ArcFace cold start
+        .event_handler = http_event_handler,
+        .user_data = &acc,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { heap_caps_free(body); return false; }
+    esp_http_client_set_header(client, "Content-Type",
+                               "multipart/form-data; boundary=" MP_BOUNDARY);
+    esp_http_client_set_header(client, "X-API-Key", VERIFIER_API_KEY);
+    esp_http_client_set_post_field(client, body, body_len);
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    heap_caps_free(body);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "enroll POST failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    if (status != 200) {
+        ESP_LOGW(TAG, "enroll HTTP %d: %s", status, acc.buf);
+        return false;
+    }
+    ESP_LOGI(TAG, "enroll accepted: %s", acc.buf);
+    return true;
+}
+
+int cloud_verify_sync_enrollments(int user_id, const char *name)
+{
+    if (name == NULL) name = "user";
+
+    int total = face_ctrl_enroll_image_count();
+    if (total <= 0) {
+        ESP_LOGW(TAG, "cloud sync: no enrollment images on flash — nothing to push");
+        return 0;
+    }
+
+    // Clear this user's existing cloud references FIRST, so a re-sync REPLACES
+    // rather than stacks. save_encoding always inserts; without this, every boot
+    // would add another 5 duplicate references and inflate the genuine-score
+    // distribution in the FAR/FRR eval. Best-effort — if it fails we still push
+    // (worst case a few duplicates, not a broken match).
+    {
+        char url[128];
+        snprintf(url, sizeof(url), VERIFIER_URL "/encodings?user_id=%d", user_id);
+        esp_http_client_config_t dcfg = {
+            .url = url,
+            .method = HTTP_METHOD_DELETE,
+            .timeout_ms = CLOUD_ENROLL_TIMEOUT_MS,   // may hit a cold server first
+        };
+        esp_http_client_handle_t dcli = esp_http_client_init(&dcfg);
+        if (dcli) {
+            esp_http_client_set_header(dcli, "X-API-Key", VERIFIER_API_KEY);
+            if (esp_http_client_perform(dcli) == ESP_OK) {
+                ESP_LOGI(TAG, "cloud sync: cleared old cloud references for user %d",
+                         user_id);
+            }
+            esp_http_client_cleanup(dcli);
+        }
+    }
+
+    ESP_LOGI(TAG, "cloud sync: pushing %d enrolled face(s) to the cloud...", total);
+
+    const char *tmp = "/spiffs/cloud_sync.jpg";
+    int synced = 0;
+    for (int i = 0; i < total; i++) {
+        if (face_ctrl_enroll_image_decrypt(i, tmp) != ESP_OK) {
+            ESP_LOGW(TAG, "cloud sync: could not decrypt enroll image %d", i);
+            continue;
+        }
+        // Read the plaintext JPEG into a PSRAM buffer.
+        FILE *f = fopen(tmp, "rb");
+        if (!f) { remove(tmp); continue; }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0) { fclose(f); remove(tmp); continue; }
+        uint8_t *buf = heap_caps_malloc((size_t) sz, MALLOC_CAP_SPIRAM);
+        if (!buf) { fclose(f); remove(tmp); continue; }
+        size_t rd = fread(buf, 1, (size_t) sz, f);
+        fclose(f);
+        remove(tmp);   // don't leave plaintext JPEG on flash
+        if (rd == (size_t) sz && post_enroll_image(user_id, name, buf, rd)) {
+            synced++;
+        }
+        heap_caps_free(buf);
+    }
+    ESP_LOGI(TAG, "cloud sync: %d/%d enrolled faces accepted by the cloud",
+             synced, total);
+    return synced;
 }

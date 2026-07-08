@@ -61,9 +61,14 @@
 // Wi-Fi/broker is unavailable at boot or at runtime, events are silently dropped
 // and the lock keeps working exactly as in Mode 1. See [[mode2-backend]].
 #define MODE2_REPORTING_ENABLED 1
-// How long to wait for Wi-Fi at boot before giving up and running offline. Short
-// so a missing network barely delays startup.
-#define WIFI_CONNECT_TIMEOUT_MS 8000
+// How long to wait for Wi-Fi at boot before giving up and running offline.
+// Must exceed the driver's own retry budget (WIFI_MAX_RETRY=5 in wifi_ctrl, each
+// auth/assoc cycle ~2.5s ≈ 12-13s total) — an 8s cap here cut the radio off at
+// ~3 retries, so a router that associated slowly on one boot (still retrying at
+// 8s) dropped us to OFFLINE even though it would have connected on retry 4/5.
+// Mode 3 needs the network for cloud sync + verify, so give the retries room to
+// finish. A truly-absent AP still fails fast (NO_AP_FOUND ends the retries early).
+#define WIFI_CONNECT_TIMEOUT_MS 20000
 
 // Master switch for the liveness challenge. 1 = require a brief frontal-motion
 // challenge after a face match before unlocking (anti-photo-spoof). 0 = face
@@ -81,10 +86,12 @@
 
 // Multi-sample enrollment: capture this many quality-gated templates per user,
 // giving up after the capture window. More samples = more robust recognition.
-// Window is generous because each detect+gate iteration takes ~1s; 12s lets all
-// 5 samples land even when some frames are rejected by the quality gate.
+// Window is generous because each detect+gate iteration takes ~1s AND the gate
+// is now stricter (only ArcFace-quality frames are kept, so more are rejected).
+// 30s gives time to position well and hold still for 5 clean samples — the ones
+// that pass both the local gate and the cloud's RetinaFace detector at sync.
 #define ENROLL_SAMPLES     5
-#define ENROLL_CAPTURE_MS  12000
+#define ENROLL_CAPTURE_MS  30000
 
 // After any successful unlock, fully PAUSE the face pipeline for this long. The
 // lock holds open ~3s; we pause a bit longer so the person can walk through
@@ -162,10 +169,12 @@ void app_main(void) {
     // start Wi-Fi + MQTT while internal RAM is still pristine, THEN init the
     // camera/face which spill their big buffers into PSRAM anyway. Reporting is
     // still non-blocking; a missing network just logs and continues (Mode 1).
+    bool wifi_up = false;
     if (ENABLE_MODE2 && MODE2_REPORTING_ENABLED) {
         if (wifi_ctrl_connect(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
             ESP_LOGI(TAG, "Wi-Fi connected — starting MQTT reporting (Mode 2)");
             mqtt_ctrl_init();  // async; reconnects in the background on its own
+            wifi_up = true;
         } else {
             ESP_LOGW(TAG, "Wi-Fi unavailable — running OFFLINE (Mode 1), no reporting");
         }
@@ -181,7 +190,35 @@ void app_main(void) {
     if (ENABLE_BUTTON) button_ctrl_init();
     if (ENABLE_KEYPAD) keypad_ctrl_init();
     if (ENABLE_CAMERA) camera_ctrl_init();
+
+    // Diagnostic camera web server: /capture (single JPEG) + /stream (live view)
+    // at http://<device-ip>/. Lets us SEE exactly what the camera captures — the
+    // ground truth for why the cloud's ArcFace rejects enrollment frames (too
+    // small? dark? torn?). Only started when online. /stream shares the camera
+    // with the face task; use /capture for a clean single grab.
+    if (wifi_up && ENABLE_CAMERA) {
+        debug_server_start();
+    }
+
     if (ENABLE_FACE)   face_ctrl_init();
+
+    // Mode 3 provisioning: with WiFi up, push the locally-enrolled faces to the
+    // cloud ONCE so /verify has a reference from THIS camera. Enrollment itself
+    // stays local-only (local modes never touch the cloud); this sync is the
+    // single point where Mode 3 mirrors the on-device faces to ArcFace. Runs
+    // after face_ctrl_init() so the encrypted enrollment images are mountable.
+    if (MODE3_ENABLED && wifi_up && ENABLE_FACE) {
+        int have = face_ctrl_enroll_image_count();
+        if (have > 0) {
+            ESP_LOGI(TAG, "Mode 3: cloud setup in progress — syncing %d face(s)...", have);
+            int synced = cloud_verify_sync_enrollments(0, "primary");
+            ESP_LOGI(TAG, "Mode 3: cloud setup done (%d/%d faces enrolled to cloud)",
+                     synced, have);
+        } else {
+            ESP_LOGW(TAG, "Mode 3: no local enrollment images to sync — "
+                          "re-enroll with *%s# to provision the cloud", ENROLL_PIN);
+        }
+    }
 
     ESP_LOGI(TAG, "System ready.");
     ESP_LOGI(TAG, "  - Show enrolled face: unlock");

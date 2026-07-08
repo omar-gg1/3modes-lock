@@ -44,9 +44,23 @@ ENROLL_MIN_BOX = 80  # px; a face smaller than this in the frame is low quality
 async def lifespan(app: FastAPI):
     storage.wait_for_db()
     storage.init_db()
-    # NOTE: we do NOT preload the model here — it's loaded lazily on first
-    # /enroll or /verify so the service comes up fast and healthchecks pass even
-    # while the model file is still downloading on first boot.
+    # Warm the ArcFace model in a BACKGROUND thread rather than lazily on first
+    # request. Lazy loading meant the very first /enroll or /verify paid a
+    # 15-20s cold-start (weight load + graph JIT) on a small instance — long
+    # enough that the ESP's boot-time enroll sync timed out (EAGAIN) before the
+    # model was ready. Warming in a thread keeps startup/healthchecks instant
+    # (we don't await it) while making the first real request fast. Failures are
+    # non-fatal: if the model isn't ready yet, _get_app() still loads it lazily.
+    import threading
+
+    def _warm():
+        try:
+            face_engine._get_app()
+            log.info("model warm-up complete — first request will be fast")
+        except Exception:
+            log.exception("model warm-up failed (will load lazily on first request)")
+
+    threading.Thread(target=_warm, name="model-warmup", daemon=True).start()
     yield
 
 
@@ -152,6 +166,24 @@ async def verify(
 def encodings(x_api_key: str | None = Header(default=None)):
     _check_key(x_api_key)
     return {"total_encodings": storage.count_encodings()}
+
+
+@app.delete("/encodings")
+def delete_encodings(user_id: int | None = None,
+                     x_api_key: str | None = Header(default=None)):
+    """Delete enrolled references. With ?user_id=N, remove only that user's
+    references (used by the ESP to make a re-sync REPLACE rather than stack, so
+    duplicate references don't skew the FAR/FRR eval). With no user_id, wipe all
+    references (full cloud reset for a clean demo/eval baseline)."""
+    _check_key(x_api_key)
+    if user_id is None:
+        deleted = storage.delete_all_encodings()
+        log.info("deleted ALL encodings (%d rows)", deleted)
+    else:
+        deleted = storage.delete_user_encodings(user_id)
+        log.info("deleted encodings for user_id=%s (%d rows)", user_id, deleted)
+    return {"deleted": deleted, "user_id": user_id,
+            "total_encodings": storage.count_encodings()}
 
 
 # ---- Evaluation insights (Phase B) --------------------------------------

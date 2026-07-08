@@ -84,6 +84,29 @@ int face_ctrl_last_detect_fail(void);
 esp_err_t face_ctrl_get_last_jpeg(const uint8_t **out_buf, size_t *out_len);
 
 /**
+ * @brief How many enrollment JPEGs are stored on flash for Mode 3 cloud sync.
+ *        These are the encrypted, gate-passed frames saved during the last
+ *        face_ctrl_enroll_multi(). The Mode 3 sync layer uses this to know how
+ *        many faces to push to the cloud /enroll endpoint.
+ *
+ * @return count of /spiffs/enroll_NN.jpg.enc files present (0..MAX_ENROLL_IMAGES).
+ */
+int face_ctrl_enroll_image_count(void);
+
+/**
+ * @brief Decrypt enrollment image @p idx to a caller-provided plaintext path,
+ *        so the Mode 3 sync layer can read the JPEG bytes and POST them to the
+ *        cloud /enroll. The caller is responsible for removing @p out_path when
+ *        done (the plaintext JPEG should not linger on flash).
+ *
+ * @param idx       0-based index, < face_ctrl_enroll_image_count().
+ * @param out_path  Where to write the decrypted JPEG (e.g. "/spiffs/sync.jpg").
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND if that image doesn't exist,
+ *         or a crypto/IO error.
+ */
+esp_err_t face_ctrl_enroll_image_decrypt(int idx, const char *out_path);
+
+/**
  * @brief Check whether the most recently detected face matches an enrolled one.
  *        Must be called immediately after face_ctrl_detect_once() returned true.
  *

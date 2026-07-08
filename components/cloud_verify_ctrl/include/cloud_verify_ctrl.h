@@ -37,6 +37,28 @@ typedef enum {
 cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
                                                  float *out_confidence);
 
+/**
+ * @brief Mode 3 one-time provisioning: push every locally-enrolled face to the
+ *        cloud so /verify has a matching reference from the SAME camera.
+ *
+ *        Enrollment is always LOCAL-only (privacy: local modes never touch the
+ *        cloud). When the device runs Mode 3 and has WiFi, it calls this once to
+ *        upload the gate-passed enrollment JPEGs (saved by face_ctrl) to the
+ *        verifier's /enroll. The cloud re-embeds them with its own ArcFace, so
+ *        both sides hold one face from one camera — the whole point of Mode 3.
+ *
+ *        Idempotent enough for repeated boots: re-enrolling on the server just
+ *        replaces the reference. Best-effort per image; a failure on one image
+ *        does not abort the rest.
+ *
+ * @param user_id  The user id to enroll these frames under (matches the local
+ *                 enrollment id, e.g. 0 for the primary user).
+ * @param name     Human-readable name required by the /enroll endpoint.
+ * @return number of enrollment images successfully accepted by the cloud
+ *         (0 if none / no enrollment images / cloud unreachable).
+ */
+int cloud_verify_sync_enrollments(int user_id, const char *name);
+
 #ifdef __cplusplus
 }
 #endif

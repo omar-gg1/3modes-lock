@@ -101,3 +101,32 @@ def count_encodings() -> int:
         return s.query(FaceEncoding).count()
     finally:
         s.close()
+
+
+def delete_user_encodings(user_id: int) -> int:
+    """Remove all references for one user. Returns rows deleted.
+
+    Enrollment (save_encoding) always INSERTS, so re-syncing the same person
+    would stack duplicate references and skew the genuine-score distribution in
+    the FAR/FRR eval. The ESP calls this once before pushing a fresh batch so a
+    re-sync REPLACES that user's references instead of accumulating them —
+    keeping the reference set (and therefore the metrics) honest.
+    """
+    s = SessionLocal()
+    try:
+        n = s.query(FaceEncoding).filter(FaceEncoding.user_id == user_id).delete()
+        s.commit()
+        return n
+    finally:
+        s.close()
+
+
+def delete_all_encodings() -> int:
+    """Wipe every enrolled reference. Returns rows deleted. Full cloud reset."""
+    s = SessionLocal()
+    try:
+        n = s.query(FaceEncoding).delete()
+        s.commit()
+        return n
+    finally:
+        s.close()
