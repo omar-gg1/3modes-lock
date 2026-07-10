@@ -80,6 +80,28 @@ This is exactly what the firmware publishes (next step).
 | GET | `/events/{id}` | One event |
 | GET | `/stats` | Counts by result and method |
 
+## Nixis control plane (phone → cloud → lock)
+
+The control plane lets the Nixis mobile app send authenticated commands to the
+lock. The app talks only to this backend; the backend is the only trusted MQTT
+publisher. Every command is HMAC-signed, time-boxed, and single-use — see the
+command/ack contract in
+`nixis-app/docs/superpowers/plans/2026-07-10-plan-0-command-contract.md`.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/auth/login` | `{username,password}` → `{access_token, token_type}` (JWT) |
+| POST | `/devices/{id}/commands` | `{type, args?}` → mints a signed command, publishes to `smartlock/{id}/commands`, awaits the ack (nonce-correlated) → `{nonce, result, detail}` |
+| GET | `/devices/{id}/status` | Reachability: `{state, rtt_ms, seconds_since}` (state = connected/reconnecting/offline) |
+| WS | `/ws?token=<jwt>` | Live push of `{kind:"event"|"ack", ...}` for logs + command results |
+
+New env keys (see `.env.example`): `CMD_HMAC_SECRET` (must match the firmware),
+`JWT_SECRET`, `NIXIS_USER`, `NIXIS_PASSWORD`.
+
+Reachability semantics: a device is `connected` if heard from within 10 s,
+`reconnecting` within 30 s, else `offline`. A `ping` command's round-trip time
+becomes the `rtt_ms` reading.
+
 ## Going to the AWS demo later
 
 For the demo host (AWS free tier — see the project decision notes):

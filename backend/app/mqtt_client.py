@@ -16,6 +16,7 @@ import paho.mqtt.client as mqtt
 
 from .database import SessionLocal, AccessEvent
 from .schemas import AccessEventIn
+from . import reachability, commands
 
 log = logging.getLogger("mqtt")
 
@@ -23,6 +24,8 @@ MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
 # '+' is a single-level wildcard: matches any device id in that slot.
 MQTT_EVENT_TOPIC = os.environ.get("MQTT_EVENT_TOPIC", "smartlock/+/events")
+# Acks from the lock (command results), same wildcard shape.
+MQTT_ACK_TOPIC = os.environ.get("MQTT_ACK_TOPIC", "smartlock/+/acks")
 # Broker auth (empty = anonymous, for a local no-auth broker). On AWS the broker
 # requires these, matching the firmware's MQTT_USERNAME/MQTT_PASSWORD.
 MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
@@ -39,21 +42,47 @@ def _device_id_from_topic(topic: str) -> str:
 
 def _on_connect(client, userdata, flags, reason_code, properties=None):
     if reason_code == 0:
-        log.info("connected to broker, subscribing to %s", MQTT_EVENT_TOPIC)
+        log.info("connected to broker, subscribing to %s and %s",
+                 MQTT_EVENT_TOPIC, MQTT_ACK_TOPIC)
         client.subscribe(MQTT_EVENT_TOPIC)
+        client.subscribe(MQTT_ACK_TOPIC, qos=1)
     else:
         log.error("broker connect failed: %s", reason_code)
 
 
+def publish(topic: str, payload: dict) -> None:
+    """Publish a JSON command to the lock (QoS 1, non-retained)."""
+    if _client is None:
+        log.warning("publish before client init: %s", topic)
+        return
+    _client.publish(topic, json.dumps(payload), qos=1, retain=False)
+
+
 def _on_message(client, userdata, msg):
-    """Validate and persist one incoming access event."""
+    """Route an inbound message: acks -> command registry, events -> DB."""
     device_id = _device_id_from_topic(msg.topic)
+    # Any message from the device proves it is alive.
+    reachability.mark_heard(device_id)
+    kind = msg.topic.split("/")[-1] if "/" in msg.topic else ""
+
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
-        evt = AccessEventIn(**payload)         # raises if the shape is wrong
     except Exception as e:
         # A bad message must never crash the subscriber — log and drop it.
         log.warning("dropping bad message on %s: %s", msg.topic, e)
+        return
+
+    if kind == "acks":
+        commands.handle_ack(payload)
+        from . import ws
+        ws.broadcast_threadsafe({"kind": "ack", "device_id": device_id, **payload})
+        return
+
+    # events branch — original behavior (validate + store)
+    try:
+        evt = AccessEventIn(**payload)         # raises if the shape is wrong
+    except Exception as e:
+        log.warning("dropping bad event on %s: %s", msg.topic, e)
         return
 
     session = SessionLocal()
@@ -71,6 +100,8 @@ def _on_message(client, userdata, msg):
         session.commit()
         log.info("stored event: %s/%s %s by %s (id=%s score=%s)",
                  device_id, evt.event, evt.result, evt.method, evt.id, evt.score)
+        from . import ws
+        ws.broadcast_threadsafe({"kind": "event", "device_id": device_id, **payload})
     except Exception as e:
         session.rollback()
         log.error("failed to store event: %s", e)

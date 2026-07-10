@@ -7,3 +7,5 @@ pydantic==2.10.4
 # mysql+pymysql:// DATABASE_URL. Pure-Python, no build step.
 PyMySQL==1.1.1
 cryptography==44.0.0
+# JWT for app login tokens (Nixis control plane).
+PyJWT==2.10.1

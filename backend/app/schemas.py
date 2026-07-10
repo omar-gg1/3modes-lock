@@ -41,3 +41,29 @@ class AccessEventOut(BaseModel):
 
     # Let Pydantic read attributes off the SQLAlchemy row object directly.
     model_config = {"from_attributes": True}
+
+
+# --- Nixis control plane (Plan A) ---
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class CommandOut(BaseModel):
+    nonce: str
+    result: str          # ok | denied | error | timeout
+    detail: str
+    rtt_ms: Optional[float] = None
+
+
+class DeviceStatusOut(BaseModel):
+    device_id: str
+    state: str           # connected | reconnecting | offline
+    rtt_ms: Optional[float] = None
+    seconds_since: Optional[float] = None
