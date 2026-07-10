@@ -10,6 +10,10 @@
 #include "esp_sntp.h"
 #include "esp_heap_caps.h"
 #include "mqtt_client.h"
+#include "cJSON.h"
+
+#include "cmd_verify.h"
+#include "lock_ctrl.h"
 
 // Broker + identity live in a gitignored header (SSID/pass are used by the
 // caller for Wi-Fi; we use the broker fields + device id here). See
@@ -21,8 +25,16 @@ static const char *TAG = "mqtt_ctrl";
 static esp_mqtt_client_handle_t s_client = NULL;
 static volatile bool s_connected = false;
 
-// Build the events topic once: smartlock/<device_id>/events.
-static char s_topic[64]; // Fix: Restored fixed-size buffer tracking array
+// Topics, built once in mqtt_ctrl_init:
+//   events   : smartlock/<device_id>/events   (outbound, existing)
+//   commands : smartlock/<device_id>/commands (inbound, Nixis command channel)
+//   acks     : smartlock/<device_id>/acks      (outbound command results)
+static char s_topic[64];      // events
+static char s_cmd_topic[64];  // commands (subscribe)
+static char s_ack_topic[64];  // acks (publish)
+
+static long long event_timestamp(void);          // fwd decl (defined below)
+static void handle_command(const char *json, int len);  // fwd decl
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
@@ -31,11 +43,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
         ESP_LOGI(TAG, "broker connected");
+        // Subscribe to the inbound command topic (QoS 1). Re-subscribes on every
+        // reconnect, which is what we want.
+        esp_mqtt_client_subscribe(s_client, s_cmd_topic, 1);
+        ESP_LOGI(TAG, "subscribed to %s", s_cmd_topic);
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
         ESP_LOGW(TAG, "broker disconnected (will retry in background)");
         break;
+    case MQTT_EVENT_DATA: {
+        esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t) event_data;
+        // esp-mqtt's topic pointer is valid for exactly topic_len bytes and is
+        // NOT guaranteed NUL-terminated, so match by length-bounded compare.
+        // Only whole messages on .../commands are handled. Payloads (~200 B) are
+        // under the 256 B buffer, so fragmentation does not occur in practice.
+        const char *suffix = "/commands";
+        const size_t suf_len = 9;  // strlen("/commands")
+        if (event->topic_len > (int) suf_len &&
+            strncmp(event->topic, "smartlock/", 10) == 0 &&
+            strncmp(event->topic + event->topic_len - suf_len, suffix, suf_len) == 0) {
+            handle_command(event->data, event->data_len);
+        }
+        break;
+    }
     case MQTT_EVENT_ERROR:
         // Non-fatal: the client retries on its own. Just note it.
         ESP_LOGW(TAG, "mqtt error event");
@@ -73,6 +104,107 @@ static long long event_timestamp(void)
     return (long long)(esp_timer_get_time() / 1000000);  // uptime fallback
 }
 
+// Publish one command ack on smartlock/<id>/acks (QoS 1). Fire-and-forget like
+// events — never blocks. nonce echoes the command; detail is a Plan 0 value.
+static void publish_ack(const char *nonce, const char *result, const char *detail)
+{
+    if (s_client == NULL) {
+        return;
+    }
+    char payload[160];
+    int n = snprintf(payload, sizeof(payload),
+        "{\"nonce\":\"%s\",\"result\":\"%s\",\"detail\":\"%s\",\"ts\":%lld}",
+        nonce, result, detail, event_timestamp());
+    if (n <= 0 || n >= (int) sizeof(payload)) {
+        ESP_LOGW(TAG, "ack payload truncated, skipping");
+        return;
+    }
+    esp_mqtt_client_enqueue(s_client, s_ack_topic, payload, n, 1, 0, true);
+    ESP_LOGI(TAG, "ack: %s -> %s/%s", nonce, result, detail);
+}
+
+// Parse + verify + execute one command JSON, then ack. Runs in the mqtt task.
+// Verification order is Plan 0: parse -> known type -> signature -> expiry ->
+// replay -> execute. A failed check acks with the reason and never acts.
+static void handle_command(const char *json, int len)
+{
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (root == NULL) {
+        // No reliable nonce to ack against — drop silently.
+        ESP_LOGW(TAG, "command: unparseable JSON dropped");
+        return;
+    }
+
+    const cJSON *jtype  = cJSON_GetObjectItem(root, "type");
+    const cJSON *jnonce = cJSON_GetObjectItem(root, "nonce");
+    const cJSON *jiat   = cJSON_GetObjectItem(root, "iat");
+    const cJSON *jexp   = cJSON_GetObjectItem(root, "exp");
+    const cJSON *jsig   = cJSON_GetObjectItem(root, "sig");
+    const cJSON *jargs  = cJSON_GetObjectItem(root, "args");
+
+    if (!cJSON_IsString(jtype) || !cJSON_IsString(jnonce) ||
+        !cJSON_IsNumber(jiat) || !cJSON_IsNumber(jexp) ||
+        !cJSON_IsString(jsig)) {
+        ESP_LOGW(TAG, "command: malformed fields dropped");
+        cJSON_Delete(root);
+        return;  // no reliable nonce -> drop
+    }
+
+    const char *type  = jtype->valuestring;
+    const char *nonce = jnonce->valuestring;
+    long long iat = (long long) jiat->valuedouble;
+    long long exp = (long long) jexp->valuedouble;
+
+    // Recompute compact args exactly as the backend did. Phase 1 commands use
+    // empty args, so "{}" is canonical. If a non-empty object is present, print
+    // it unformatted (Phase 2 must ensure the backend sends sorted keys).
+    char argsbuf[128] = "{}";
+    if (jargs != NULL && cJSON_IsObject(jargs) && jargs->child != NULL) {
+        char *p = cJSON_PrintUnformatted((cJSON *) jargs);
+        if (p != NULL) {
+            snprintf(argsbuf, sizeof(argsbuf), "%s", p);
+            cJSON_free(p);
+        }
+    }
+
+    char sstr[256];
+    cmd_build_signing_string(sstr, sizeof(sstr), MQTT_DEVICE_ID, type, nonce,
+                             iat, exp, argsbuf);
+
+    // 1) signature
+    if (!cmd_sig_matches(CMD_HMAC_SECRET, sstr, jsig->valuestring)) {
+        publish_ack(nonce, "denied", "bad_sig");
+        cJSON_Delete(root);
+        return;
+    }
+    // 2) expiry — needs a real (SNTP-synced) clock. If unsynced, event_timestamp
+    // returns uptime seconds (< 1.7e9), which we treat as expired: never accept
+    // a command we cannot time-check.
+    long long now = event_timestamp();
+    if (now < 1700000000LL || now > exp) {
+        publish_ack(nonce, "denied", "expired");
+        cJSON_Delete(root);
+        return;
+    }
+    // 3) replay
+    if (cmd_nonce_seen_or_record(nonce)) {
+        publish_ack(nonce, "denied", "replay");
+        cJSON_Delete(root);
+        return;
+    }
+    // 4) dispatch
+    if (strcmp(type, "ping") == 0) {
+        publish_ack(nonce, "ok", "pong");
+    } else if (strcmp(type, "unlock") == 0) {
+        lock_ctrl_trigger_unlock("app command");
+        publish_ack(nonce, "ok", "unlocked");
+    } else {
+        publish_ack(nonce, "error", "unknown_type");
+    }
+
+    cJSON_Delete(root);
+}
+
 esp_err_t mqtt_ctrl_init(void)
 {
     if (s_client != NULL) {
@@ -82,7 +214,13 @@ esp_err_t mqtt_ctrl_init(void)
 
     time_sync_start();
 
+    // Prove the command-verify core matches the backend byte-for-byte (KAT).
+    // Logs PASS/FAIL over serial — visible evidence the HMAC is interoperable.
+    cmd_verify_selftest();
+
     snprintf(s_topic, sizeof(s_topic), "smartlock/%s/events", MQTT_DEVICE_ID);
+    snprintf(s_cmd_topic, sizeof(s_cmd_topic), "smartlock/%s/commands", MQTT_DEVICE_ID);
+    snprintf(s_ack_topic, sizeof(s_ack_topic), "smartlock/%s/acks", MQTT_DEVICE_ID);
 
     // Keep MQTT's memory footprint SMALL. 
     esp_mqtt_client_config_t cfg;

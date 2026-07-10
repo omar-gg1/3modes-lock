@@ -19,6 +19,14 @@
 // Identifies this lock; becomes the topic smartlock/<MQTT_DEVICE_ID>/events.
 #define MQTT_DEVICE_ID  "lock-01"
 
+// ---- Nixis command channel (Plan 0) ----
+// 32-byte HMAC-SHA256 secret as 64 hex chars. MUST equal the backend's
+// CMD_HMAC_SECRET (.env). Gates command authenticity independent of the broker
+// password — the app -> backend -> lock command path is signed with this.
+// Staged in this header for now; eFuse later (like the AES key).
+// Generate: python -c "import secrets;print(secrets.token_hex(32))"
+#define CMD_HMAC_SECRET "0000000000000000000000000000000000000000000000000000000000000000"
+
 // ---- Optional broker auth ----
 // Uncomment BOTH to enable username/password auth (required for a public broker).
 // #define MQTT_USERNAME  "smartlock"
