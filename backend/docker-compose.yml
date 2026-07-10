@@ -60,6 +60,12 @@ services:
       MQTT_USERNAME: ${MQTT_USERNAME}
       MQTT_PASSWORD: ${MQTT_PASSWORD}
       DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}"
+      # Nixis control plane — command signing, JWT login (must match firmware).
+      MQTT_ACK_TOPIC: "smartlock/+/acks"
+      CMD_HMAC_SECRET: ${CMD_HMAC_SECRET}
+      JWT_SECRET: ${JWT_SECRET}
+      NIXIS_USER: ${NIXIS_USER}
+      NIXIS_PASSWORD: ${NIXIS_PASSWORD}
     depends_on:
       mysql:
         condition: service_healthy
