@@ -17,7 +17,8 @@ import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (FastAPI, Depends, HTTPException, Query, WebSocket,
+                     WebSocketDisconnect, status)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -25,8 +26,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import mqtt_client, security, reachability, commands
-from .database import SessionLocal, AccessEvent, init_db, wait_for_db
-from .schemas import AccessEventOut, LoginIn, TokenOut, DeviceStatusOut, CommandOut
+from .database import SessionLocal, AccessEvent, User, init_db, wait_for_db
+from .schemas import (AccessEventOut, LoginIn, TokenOut, DeviceStatusOut,
+                      CommandOut, UserIn, UserUpdate, UserOut)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -145,6 +147,21 @@ async def ws_endpoint(websocket: WebSocket, token: str = ""):
         ws.manager.remove(queue)
 
 
+def _attach_user_names(db: Session, rows: list) -> list[AccessEventOut]:
+    """Stamp each event with the CURRENT display name for its user_id.
+
+    One users query builds a {user_id: name} map, so renaming a user instantly
+    relabels all their history. Events with a NULL or unknown user_id get None.
+    """
+    name_by_id = dict(db.query(User.user_id, User.name).all())
+    out = []
+    for r in rows:
+        e = AccessEventOut.model_validate(r)
+        e.user_name = name_by_id.get(r.user_id)
+        out.append(e)
+    return out
+
+
 @app.get("/events", response_model=list[AccessEventOut])
 def list_events(
     db: Session = Depends(get_db),
@@ -162,7 +179,8 @@ def list_events(
         q = q.filter(AccessEvent.method == method)
     if result:
         q = q.filter(AccessEvent.result == result)
-    return q.order_by(AccessEvent.id.desc()).limit(limit).all()
+    rows = q.order_by(AccessEvent.id.desc()).limit(limit).all()
+    return _attach_user_names(db, rows)
 
 
 @app.get("/events/{event_id}", response_model=AccessEventOut)
@@ -170,7 +188,7 @@ def get_event(event_id: int, db: Session = Depends(get_db)):
     row = db.get(AccessEvent, event_id)
     if row is None:
         raise HTTPException(status_code=404, detail="event not found")
-    return row
+    return _attach_user_names(db, [row])[0]
 
 
 @app.get("/stats")
@@ -186,3 +204,70 @@ def stats(db: Session = Depends(get_db)):
           .group_by(AccessEvent.method).all()
     )
     return {"total": total, "by_result": by_result, "by_method": by_method}
+
+
+# --- User management (phase 1) ---
+
+MAX_USER_ID = 32767   # firmware s_feat_user_map is int16_t
+
+
+@app.get("/users", response_model=list[UserOut])
+def list_users(db: Session = Depends(get_db), _sub: str = Depends(require_auth)):
+    """All users, ascending by id (seed user_id=0 first)."""
+    return db.query(User).order_by(User.user_id.asc()).all()
+
+
+@app.post("/users", response_model=UserOut)
+def create_user(body: UserIn, db: Session = Depends(get_db),
+                _sub: str = Depends(require_auth)):
+    """Allocate the next monotonic user_id (MAX+1) and create the row.
+
+    Explicit allocation (not DB autoincrement) so phase-2 firmware enroll can be
+    told which id to enroll a face into. Rejected if it would exceed int16.
+    """
+    max_id = db.query(func.max(User.user_id)).scalar()
+    next_id = (max_id if max_id is not None else -1) + 1
+    if next_id > MAX_USER_ID:
+        raise HTTPException(status_code=400,
+                            detail=f"user_id would exceed firmware max {MAX_USER_ID}")
+    user = User(user_id=next_id, name=body.name, image_url=body.image_url)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.get("/users/{user_id}", response_model=UserOut)
+def get_user(user_id: int, db: Session = Depends(get_db),
+             _sub: str = Depends(require_auth)):
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return user
+
+
+@app.patch("/users/{user_id}", response_model=UserOut)
+def update_user(user_id: int, body: UserUpdate, db: Session = Depends(get_db),
+                _sub: str = Depends(require_auth)):
+    """Rename / set image_url. Only fields present in the body are applied."""
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(user, field, value)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(user_id: int, db: Session = Depends(get_db),
+                _sub: str = Depends(require_auth)):
+    """Delete a user's record. The SUDO OJ seed (id 0) is protected."""
+    if user_id == 0:
+        raise HTTPException(status_code=400, detail="cannot delete the SUDO OJ seed user")
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    db.delete(user)
+    db.commit()

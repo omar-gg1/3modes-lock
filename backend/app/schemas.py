@@ -38,6 +38,7 @@ class AccessEventOut(BaseModel):
     score: Optional[float]
     device_ts: Optional[int]
     received_at: datetime
+    user_name: Optional[str] = None   # current display name for user_id, joined at read time
 
     # Let Pydantic read attributes off the SQLAlchemy row object directly.
     model_config = {"from_attributes": True}
@@ -67,3 +68,27 @@ class DeviceStatusOut(BaseModel):
     state: str           # connected | reconnecting | offline
     rtt_ms: Optional[float] = None
     seconds_since: Optional[float] = None
+
+
+# --- User management (phase 1) ---
+
+class UserIn(BaseModel):
+    """Create-user body. Only a name is required; image_url is a phase-3 hook."""
+    name: str
+    image_url: Optional[str] = None
+
+
+class UserUpdate(BaseModel):
+    """Patch body — every field optional; only provided fields are applied."""
+    name: Optional[str] = None
+    image_url: Optional[str] = None
+
+
+class UserOut(BaseModel):
+    """A stored user as returned by the REST API."""
+    user_id: int
+    name: str
+    image_url: Optional[str]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

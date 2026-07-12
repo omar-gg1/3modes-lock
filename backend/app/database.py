@@ -80,6 +80,34 @@ class AccessEvent(Base):
     received_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class User(Base):
+    """A named person the lock recognizes, keyed to the firmware's user_id.
+
+    user_id is allocated by the backend (monotonic, MAX+1), NOT auto-increment,
+    because phase-2 firmware enroll must be told which id to enroll a face into.
+    It is also the join key into access_events.user_id, so the /events history
+    can show "SUDO OJ unlocked the door" instead of "user 0".
+    """
+    __tablename__ = "users"
+
+    # NOT autoincrement — the backend allocates ids explicitly (see main.py).
+    user_id = Column(Integer, primary_key=True, autoincrement=False)
+    name = Column(String(64))                        # display name (MySQL needs a length)
+    image_url = Column(String(512), nullable=True)   # phase-3 profile picture URL; unused in phase 1
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 def init_db():
-    """Create tables if they don't exist. Safe to call on every startup."""
+    """Create tables if they don't exist, and seed user_id=0 as SUDO OJ.
+
+    Safe to call on every startup: the seed inserts only if the row is missing,
+    so a later rename of user 0 survives restarts.
+    """
     Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        if db.get(User, 0) is None:
+            db.add(User(user_id=0, name="SUDO OJ"))
+            db.commit()
+    finally:
+        db.close()
