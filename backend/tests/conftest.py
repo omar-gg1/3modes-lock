@@ -1,6 +1,14 @@
 import os
+import tempfile
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+# A temp FILE (not :memory:) so every connection — the request's session and a
+# test's own SessionLocal — sees the same database. In-memory SQLite gives each
+# connection its own empty DB, which breaks any test that writes rows in one
+# place and reads them via the API in another.
+_db_path = os.path.join(tempfile.gettempdir(), "nixis_test.db")
+if os.path.exists(_db_path):
+    os.remove(_db_path)
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 os.environ.setdefault("CMD_HMAC_SECRET", "00" * 32)
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret")
 os.environ.setdefault("NIXIS_USER", "admin")

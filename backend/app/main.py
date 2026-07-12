@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -46,6 +47,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Smart Lock Backend (Mode 2 Hybrid)", lifespan=lifespan)
+
+# Allow the Nixis app (web/mobile) to call the API from a browser origin.
+# Open for the demo; tighten allow_origins to the app's host for production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def get_db():
@@ -137,6 +148,7 @@ async def ws_endpoint(websocket: WebSocket, token: str = ""):
 @app.get("/events", response_model=list[AccessEventOut])
 def list_events(
     db: Session = Depends(get_db),
+    _sub: str = Depends(require_auth),
     device_id: Optional[str] = None,
     method: Optional[str] = Query(default=None, description="face | pin | button"),
     result: Optional[str] = Query(default=None, description="granted | denied"),
