@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "face_ctrl.h"
 #include "lock_ctrl.h"
 #include "button_ctrl.h"
@@ -92,6 +93,7 @@
 // that pass both the local gate and the cloud's RetinaFace detector at sync.
 #define ENROLL_SAMPLES     5
 #define ENROLL_CAPTURE_MS  30000
+#define MAX_ENROLL_USERS_MAIN 16   // mirrors face_ctrl's MAX_ENROLL_USERS
 
 // After any successful unlock, fully PAUSE the face pipeline for this long. The
 // lock holds open ~3s; we pause a bit longer so the person can walk through
@@ -156,6 +158,66 @@ static void nvs_init_safe(void) {
     ESP_ERROR_CHECK(ret);
 }
 
+// Last cloud faces-revision we reconciled against. Persisted so a boot with an
+// unchanged cloud gallery skips the whole sync (no more 35s re-enroll every boot).
+#define SYNC_NVS_NS   "nixis_sync"
+#define SYNC_NVS_KEY  "faces_rev"   // packs count<<16 | max_id
+
+static int32_t sync_rev_load(void) {
+    nvs_handle_t h;
+    if (nvs_open(SYNC_NVS_NS, NVS_READONLY, &h) != ESP_OK) return -1;
+    int32_t v = -1;
+    nvs_get_i32(h, SYNC_NVS_KEY, &v);
+    nvs_close(h);
+    return v;
+}
+
+static void sync_rev_store(int32_t v) {
+    nvs_handle_t h;
+    if (nvs_open(SYNC_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, SYNC_NVS_KEY, v);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Revision-gated bidirectional sync. Replaces the old blind "push every local
+// image as user 0 on every boot" that collapsed all users into one cloud
+// gallery. Push each LOCAL user's own faces (tagged with their real id), then
+// PULL any cloud users we don't hold locally so they match on the fast local
+// pass too. Skips entirely when the cloud revision is unchanged since last boot.
+static void mode3_reconcile(void) {
+    int cloud_count = 0, cloud_max = 0;
+    bool have_rev = cloud_verify_faces_revision(&cloud_count, &cloud_max);
+
+    int local_users[MAX_ENROLL_USERS_MAIN];
+    int n_local = face_ctrl_enrolled_user_ids(local_users, MAX_ENROLL_USERS_MAIN);
+
+    int32_t rev = have_rev ? ((cloud_count << 16) | (cloud_max & 0xFFFF)) : -1;
+    if (have_rev && rev == sync_rev_load() && n_local > 0) {
+        ESP_LOGI(TAG, "Mode 3: cloud unchanged (rev %d) — skipping sync", (int)rev);
+        return;
+    }
+
+    // Push every local user's faces under their OWN id (never a flat user 0).
+    for (int i = 0; i < n_local; i++) {
+        int uid = local_users[i];
+        int synced = cloud_verify_sync_enrollments(uid, uid == 0 ? "primary" : "user");
+        ESP_LOGI(TAG, "Mode 3: pushed user %d -> %d face(s) to cloud", uid, synced);
+    }
+
+    // Pull cloud users we don't already hold locally (e.g. app-enrolled), so they
+    // recognize on the local pass. Re-read the local set AFTER pushing.
+    n_local = face_ctrl_enrolled_user_ids(local_users, MAX_ENROLL_USERS_MAIN);
+    if (have_rev && cloud_count > 0) {
+        cloud_verify_pull_new_faces(local_users, n_local);
+    }
+
+    // Re-read the revision AFTER our push so next boot sees a stable value.
+    if (cloud_verify_faces_revision(&cloud_count, &cloud_max)) {
+        sync_rev_store((cloud_count << 16) | (cloud_max & 0xFFFF));
+    }
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "==== Smart Lock booting ====");
 
@@ -198,16 +260,9 @@ void app_main(void) {
     // single point where Mode 3 mirrors the on-device faces to ArcFace. Runs
     // after face_ctrl_init() so the encrypted enrollment images are mountable.
     if (MODE3_ENABLED && wifi_up && ENABLE_FACE) {
-        int have = face_ctrl_enroll_image_count();
-        if (have > 0) {
-            ESP_LOGI(TAG, "Mode 3: cloud setup in progress — syncing %d face(s)...", have);
-            int synced = cloud_verify_sync_enrollments(0, "primary");
-            ESP_LOGI(TAG, "Mode 3: cloud setup done (%d/%d faces enrolled to cloud)",
-                     synced, have);
-        } else {
-            ESP_LOGW(TAG, "Mode 3: no local enrollment images to sync — "
-                          "re-enroll with *%s# to provision the cloud", ENROLL_PIN);
-        }
+        ESP_LOGI(TAG, "Mode 3: reconciling faces with cloud...");
+        mode3_reconcile();
+        ESP_LOGI(TAG, "Mode 3: reconcile done");
     }
 
     ESP_LOGI(TAG, "System ready.");
@@ -222,6 +277,9 @@ void app_main(void) {
 
     bool enrollment_armed = false;
     int64_t enrollment_armed_at_us = 0;
+    bool append_armed = false;
+    int64_t append_armed_at_us = 0;
+    int append_user = 0, append_samples = 0;
 
     // PIN entry buffer. Built up as keys are pressed.
     // '*' at start arms enrollment; '*' mid-entry clears.
@@ -333,29 +391,50 @@ void app_main(void) {
             }
         }
 
-        // Remotely-armed append-enroll (from an append_enroll command). Runs the
-        // same blocking capture as the keypad path, but targeted at a specific
-        // user_id and WITHOUT wiping existing users.
-        {
-            int req_user = 0, req_samples = 0;
-            if (enroll_request_take(&req_user, &req_samples)) {
-                ESP_LOGI(TAG, ">>> remote append-enroll user=%d samples=%d",
-                         req_user, req_samples);
-                if (face_ctrl_detect_once()) {
-                    esp_err_t er = face_ctrl_enroll_append(req_user, req_samples,
-                                                           ENROLL_CAPTURE_MS);
-                    bool ok = (er == ESP_OK);
-                    ESP_LOGI(TAG, ">>> append-enroll user=%d %s",
-                             req_user, ok ? "OK" : "FAILED");
-                    mqtt_ctrl_publish_event(MQTT_METHOD_FACE, req_user, NAN, ok);
-                } else {
-                    ESP_LOGW(TAG, "append-enroll: no face to start capture");
-                    mqtt_ctrl_publish_event(MQTT_METHOD_FACE, req_user, NAN, false);
+        // Remotely-armed append-enroll (from an append_enroll command). Arms a
+        // timed window like the keypad path so the user can walk up to the
+        // camera; a one-shot detect fails the instant the command arrives.
+        if (enroll_request_take(&append_user, &append_samples)) {
+            append_armed = true;
+            append_armed_at_us = esp_timer_get_time();
+            ESP_LOGI(TAG, ">>> remote append-enroll armed user=%d samples=%d — "
+                     "show your face within %ds",
+                     append_user, append_samples, ENROLLMENT_TIMEOUT_MS / 1000);
+        }
+        if (append_armed) {
+            int64_t elapsed_ms =
+                (esp_timer_get_time() - append_armed_at_us) / 1000;
+            if (face_ctrl_detect_once()) {
+                esp_err_t er = face_ctrl_enroll_append(append_user, append_samples,
+                                                       ENROLL_CAPTURE_MS);
+                bool ok = (er == ESP_OK);
+                ESP_LOGI(TAG, ">>> append-enroll user=%d %s",
+                         append_user, ok ? "OK" : "FAILED");
+                // Push THIS user's fresh faces to the cloud under their own id
+                // (not user 0), so the cloud gallery stays multi-user. Then bump
+                // the stored revision so the next boot doesn't needlessly re-sync.
+                if (ok && MODE3_ENABLED) {
+                    int synced = cloud_verify_sync_enrollments(
+                        append_user, append_user == 0 ? "primary" : "user");
+                    ESP_LOGI(TAG, ">>> cloud sync user=%d: %d face(s)",
+                             append_user, synced);
+                    int cc = 0, cm = 0;
+                    if (cloud_verify_faces_revision(&cc, &cm))
+                        sync_rev_store((cc << 16) | (cm & 0xFFFF));
                 }
+                mqtt_ctrl_publish_event(MQTT_METHOD_FACE, append_user, NAN, ok);
+                append_armed = false;
                 face_state = FACE_SCANNING;
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
+            } else if (elapsed_ms > ENROLLMENT_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "append-enroll: no face within window");
+                mqtt_ctrl_publish_event(MQTT_METHOD_FACE, append_user, NAN, false);
+                append_armed = false;
+                face_state = FACE_SCANNING;
             }
+            // still armed and inside the window: fall through, poll again
+            if (append_armed) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
         }
 
         // ---- Enrollment takes priority over the normal pipeline ----

@@ -268,13 +268,168 @@ static bool post_enroll_image(int user_id, const char *name,
     return true;
 }
 
+// A bigger accumulator for the /faces LIST (many rows) than the 1KB verify buf.
+// 8KB holds ~250 rows of {"id":N,"user_id":N,"name":"..","source":".."}.
+#define FACES_BUF_SIZE 8192
+typedef struct { char *buf; int cap; int len; } big_accum_t;
+
+static esp_err_t big_http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->user_data) {
+        big_accum_t *acc = (big_accum_t *) evt->user_data;
+        int space = acc->cap - 1 - acc->len;
+        if (space > 0) {
+            int n = evt->data_len < space ? evt->data_len : space;
+            memcpy(acc->buf + acc->len, evt->data, n);
+            acc->len += n;
+            acc->buf[acc->len] = 0;
+        }
+    }
+    return ESP_OK;
+}
+
+bool cloud_verify_faces_revision(int *out_count, int *out_max_id)
+{
+    resp_accum_t acc = {0};
+    char url[128];
+    snprintf(url, sizeof(url), VERIFIER_URL "/faces/revision");
+    esp_http_client_config_t cfg = {
+        .url = url, .method = HTTP_METHOD_GET,
+        .timeout_ms = CLOUD_VERIFY_TIMEOUT_MS,
+        .event_handler = http_event_handler, .user_data = &acc,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return false;
+    esp_http_client_set_header(cli, "X-API-Key", VERIFIER_API_KEY);
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "faces revision: unreachable (err=%d status=%d)", err, status);
+        return false;
+    }
+    float c = 0, m = 0;
+    json_number(acc.buf, "count", &c);
+    json_number(acc.buf, "max_id", &m);
+    if (out_count)  *out_count  = (int) c;
+    if (out_max_id) *out_max_id = (int) m;
+    return true;
+}
+
+// Fetch one face image (GET /faces/{id}/image) into a PSRAM buffer. Caller frees.
+static uint8_t *fetch_face_image(int enc_id, size_t *out_len)
+{
+    uint8_t *buf = heap_caps_malloc(64 * 1024, MALLOC_CAP_SPIRAM);
+    if (!buf) return NULL;
+    big_accum_t acc = { .buf = (char *) buf, .cap = 64 * 1024, .len = 0 };
+    char url[128];
+    snprintf(url, sizeof(url), VERIFIER_URL "/faces/%d/image", enc_id);
+    esp_http_client_config_t cfg = {
+        .url = url, .method = HTTP_METHOD_GET,
+        .timeout_ms = CLOUD_ENROLL_TIMEOUT_MS,
+        .event_handler = big_http_event_handler, .user_data = &acc,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) { heap_caps_free(buf); return NULL; }
+    esp_http_client_set_header(cli, "X-API-Key", VERIFIER_API_KEY);
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200 || acc.len < 4) {
+        heap_caps_free(buf);
+        return NULL;
+    }
+    *out_len = acc.len;
+    return buf;
+}
+
+bool cloud_verify_delete_user(int user_id)
+{
+    char url[128];
+    snprintf(url, sizeof(url), VERIFIER_URL "/encodings?user_id=%d", user_id);
+    esp_http_client_config_t cfg = {
+        .url = url, .method = HTTP_METHOD_DELETE,
+        .timeout_ms = CLOUD_ENROLL_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return false;
+    esp_http_client_set_header(cli, "X-API-Key", VERIFIER_API_KEY);
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    bool ok = (err == ESP_OK && status == 200);
+    ESP_LOGI(TAG, "cloud delete user %d: %s (status=%d)", user_id,
+             ok ? "ok" : "FAILED", status);
+    return ok;
+}
+
+int cloud_verify_pull_new_faces(const int *known_users, int known_count)
+{
+    // GET /faces, and for every face whose user_id we DON'T already hold locally,
+    // pull its JPEG and import it into the local recognizer. This is how an
+    // app-enrolled user (that this camera never saw) comes to match on the fast
+    // local pass too. Per-user sample counter so local image filenames don't clash.
+    char *body = heap_caps_malloc(FACES_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!body) return 0;
+    big_accum_t acc = { .buf = body, .cap = FACES_BUF_SIZE, .len = 0 };
+    char url[128];
+    snprintf(url, sizeof(url), VERIFIER_URL "/faces");
+    esp_http_client_config_t cfg = {
+        .url = url, .method = HTTP_METHOD_GET,
+        .timeout_ms = CLOUD_VERIFY_TIMEOUT_MS,
+        .event_handler = big_http_event_handler, .user_data = &acc,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) { heap_caps_free(body); return 0; }
+    esp_http_client_set_header(cli, "X-API-Key", VERIFIER_API_KEY);
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "pull faces: list unreachable (err=%d status=%d)", err, status);
+        heap_caps_free(body);
+        return 0;
+    }
+
+    // Walk the array element by element: each object has "id" and "user_id".
+    // Reuse the top-level-key-aware json_number by scanning object-at-a-time.
+    int imported = 0;
+    int sample_of[64];               // per-user local sample counter (id 0..63)
+    memset(sample_of, 0, sizeof(sample_of));
+    const char *p = body;
+    while ((p = strstr(p, "\"id\"")) != NULL) {
+        float fid = -1, fuid = -1;
+        json_number(p, "id", &fid);
+        json_number(p, "user_id", &fuid);
+        p += 4;
+        int enc_id = (int) fid, uid = (int) fuid;
+        if (enc_id < 0 || uid < 0) continue;
+
+        bool known = false;
+        for (int k = 0; k < known_count; k++)
+            if (known_users[k] == uid) { known = true; break; }
+        if (known) continue;   // we already hold this user locally
+
+        size_t jlen = 0;
+        uint8_t *jpg = fetch_face_image(enc_id, &jlen);
+        if (!jpg) { ESP_LOGW(TAG, "pull: image %d fetch failed", enc_id); continue; }
+        int s = (uid < 64) ? sample_of[uid]++ : 0;
+        if (face_ctrl_import_face(uid, s, jpg, jlen) == ESP_OK) imported++;
+        heap_caps_free(jpg);
+    }
+    heap_caps_free(body);
+    ESP_LOGI(TAG, "pull faces: imported %d new cloud face(s)", imported);
+    return imported;
+}
+
 int cloud_verify_sync_enrollments(int user_id, const char *name)
 {
     if (name == NULL) name = "user";
 
-    int total = face_ctrl_enroll_image_count();
+    int total = face_ctrl_enroll_image_count(user_id);
     if (total <= 0) {
-        ESP_LOGW(TAG, "cloud sync: no enrollment images on flash — nothing to push");
+        ESP_LOGW(TAG, "cloud sync: no enrollment images for user %d — nothing to push",
+                 user_id);
         return 0;
     }
 
@@ -307,8 +462,8 @@ int cloud_verify_sync_enrollments(int user_id, const char *name)
     const char *tmp = "/spiffs/cloud_sync.jpg";
     int synced = 0;
     for (int i = 0; i < total; i++) {
-        if (face_ctrl_enroll_image_decrypt(i, tmp) != ESP_OK) {
-            ESP_LOGW(TAG, "cloud sync: could not decrypt enroll image %d", i);
+        if (face_ctrl_enroll_image_decrypt(user_id, i, tmp) != ESP_OK) {
+            ESP_LOGW(TAG, "cloud sync: could not decrypt user %d image %d", user_id, i);
             continue;
         }
         // Read the plaintext JPEG into a PSRAM buffer.

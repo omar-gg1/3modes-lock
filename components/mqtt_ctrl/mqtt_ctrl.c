@@ -16,6 +16,7 @@
 #include "lock_ctrl.h"
 #include "enroll_request.h"
 #include "face_ctrl.h"
+#include "cloud_verify_ctrl.h"
 
 // Broker + identity live in a gitignored header (SSID/pass are used by the
 // caller for Wi-Fi; we use the broker fields + device id here). See
@@ -181,9 +182,12 @@ static void handle_command(const char *json, int len)
     }
     // 2) expiry — needs a real (SNTP-synced) clock. If unsynced, event_timestamp
     // returns uptime seconds (< 1.7e9), which we treat as expired: never accept
-    // a command we cannot time-check.
+    // a command we cannot time-check. CMD_SKEW_S absorbs SNTP jitter so a fresh
+    // command isn't nipped by a sub-second drift against the 8s window.
+    // ponytail: fixed 5s allowance, widen only if real drift exceeds it.
+    const long long CMD_SKEW_S = 5;
     long long now = event_timestamp();
-    if (now < 1700000000LL || now > exp) {
+    if (now < 1700000000LL || now > exp + CMD_SKEW_S) {
         publish_ack(nonce, "denied", "expired");
         cJSON_Delete(root);
         return;
@@ -206,7 +210,11 @@ static void handle_command(const char *json, int len)
             publish_ack(nonce, "error", "bad_args");
         } else {
             int deleted = 0;
-            face_ctrl_delete_user((int) juid->valuedouble, &deleted);
+            int uid = (int) juid->valuedouble;
+            face_ctrl_delete_user(uid, &deleted);
+            // Keep the cloud gallery consistent: remove this user's references
+            // there too, else the deleted person still matches via /verify.
+            cloud_verify_delete_user(uid);
             publish_ack(nonce, "ok", "deleted");
         }
     } else if (strcmp(type, "append_enroll") == 0) {

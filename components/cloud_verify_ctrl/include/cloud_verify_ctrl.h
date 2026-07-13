@@ -59,6 +59,35 @@ cloud_verify_result_t cloud_verify_current_frame(int *out_user_id,
  */
 int cloud_verify_sync_enrollments(int user_id, const char *name);
 
+/**
+ * @brief Read the cloud gallery's revision token (GET /faces/revision). The ESP
+ *        stores the last value it synced and only reconciles when it differs —
+ *        replacing the old blind "re-push everything on every boot" sync.
+ * @param out_count  [out] total enrolled encodings. May be NULL.
+ * @param out_max_id [out] highest encoding id (monotonic). May be NULL.
+ * @return true if the revision was read, false if the verifier was unreachable.
+ */
+bool cloud_verify_faces_revision(int *out_count, int *out_max_id);
+
+/**
+ * @brief Pull faces for users this device does NOT already hold locally and
+ *        import them into the local recognizer (GET /faces, then per-image
+ *        GET /faces/{id}/image). This makes an app-enrolled user match on the
+ *        fast local pass, not only via a cloud round-trip.
+ * @param known_users Array of user ids already enrolled locally (skip these).
+ * @param known_count Length of known_users.
+ * @return number of cloud faces imported.
+ */
+int cloud_verify_pull_new_faces(const int *known_users, int known_count);
+
+/**
+ * @brief Remove one user's references from the cloud gallery
+ *        (DELETE /encodings?user_id=N). Keeps the cloud consistent with a local
+ *        delete_user so the deleted person stops matching on both sides.
+ * @return true if the cloud accepted the delete.
+ */
+bool cloud_verify_delete_user(int user_id);
+
 #ifdef __cplusplus
 }
 #endif

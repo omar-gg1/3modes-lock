@@ -89,9 +89,20 @@ esp_err_t face_ctrl_get_last_jpeg(const uint8_t **out_buf, size_t *out_len);
  *        face_ctrl_enroll_multi(). The Mode 3 sync layer uses this to know how
  *        many faces to push to the cloud /enroll endpoint.
  *
- * @return count of /spiffs/enroll_NN.jpg.enc files present (0..MAX_ENROLL_IMAGES).
+ * @param user_id Which user's images to count.
+ * @return count of /spiffs/enroll_uUUU_SS.jpg.enc for this user (0..8).
  */
-int face_ctrl_enroll_image_count(void);
+int face_ctrl_enroll_image_count(int user_id);
+
+/**
+ * @brief List every user that has at least one enrollment image on flash.
+ *        The Mode 3 sync layer uses this to push each user's own faces under
+ *        their own id (never a flat 'everyone as user 0').
+ * @param out_ids Caller buffer receiving the user ids.
+ * @param max     Capacity of out_ids.
+ * @return number of ids written.
+ */
+int face_ctrl_enrolled_user_ids(int *out_ids, int max);
 
 /**
  * @brief Decrypt enrollment image @p idx to a caller-provided plaintext path,
@@ -99,12 +110,14 @@ int face_ctrl_enroll_image_count(void);
  *        cloud /enroll. The caller is responsible for removing @p out_path when
  *        done (the plaintext JPEG should not linger on flash).
  *
- * @param idx       0-based index, < face_ctrl_enroll_image_count().
+ * @param user_id   Which user's image.
+ * @param sample    0-based sample index, < face_ctrl_enroll_image_count(user_id).
  * @param out_path  Where to write the decrypted JPEG (e.g. "/spiffs/sync.jpg").
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if that image doesn't exist,
  *         or a crypto/IO error.
  */
-esp_err_t face_ctrl_enroll_image_decrypt(int idx, const char *out_path);
+esp_err_t face_ctrl_enroll_image_decrypt(int user_id, int sample,
+                                         const char *out_path);
 
 /**
  * @brief Check whether the most recently detected face matches an enrolled one.
@@ -142,6 +155,20 @@ esp_err_t face_ctrl_get_keypoints(int *out_keypoints, int max, int *out_count);
  * @return ESP_OK if >=1 template stored, ESP_ERR_NOT_FOUND if no good face.
  */
 esp_err_t face_ctrl_enroll_append(int user_id, int samples_wanted, int timeout_ms);
+
+/**
+ * @brief Enroll a face that came FROM the cloud (pulled JPEG) into the LOCAL
+ *        recognizer under @p user_id, so an app-enrolled user also matches on the
+ *        device's fast local pass. Decodes + detects + enrolls the image and
+ *        keeps a local encrypted copy.
+ * @param user_id Owner of this face.
+ * @param sample  Per-user sample index (0-based) for the local image filename.
+ * @param jpeg    JPEG bytes pulled from the verifier.
+ * @param len     JPEG length.
+ * @return ESP_OK if enrolled, ESP_ERR_NOT_FOUND if no face in the image, else err.
+ */
+esp_err_t face_ctrl_import_face(int user_id, int sample,
+                                const uint8_t *jpeg, size_t len);
 
 /**
  * @brief Remove every face feature belonging to @p user_id from the recognizer.

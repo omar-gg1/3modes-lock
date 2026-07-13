@@ -51,6 +51,8 @@ static detect_fail_t s_last_detect_fail = DETECT_FAIL_NONE;
 // next to the DB and kept in lockstep with it on every enroll/delete.
 #define MAX_FEATURES 64
 #define FEATMAP_MAGIC 0x4E464D32u   // "NFM2" — bump if the on-disk format changes
+#define MAX_ENROLL_IMAGES 8         // cloud-sync JPEG samples kept per user
+#define MAX_ENROLL_USERS  16        // distinct users whose images we scan for
 static int16_t  s_feat_users[MAX_FEATURES + 1];
 static uint16_t s_feat_stored_ids[MAX_FEATURES + 1];
 static int      s_feat_count = 0;   // number of valid features shadowed
@@ -154,6 +156,37 @@ static void featmap_load(void)
     ESP_LOGI(TAG, "featmap loaded: %d features mapped", s_feat_count);
 }
 
+// Defined later (with the enroll-image helpers); forward-declared so the boot
+// featmap rebuild below can use them.
+static int enroll_imgs_count_user(int user_id);
+
+// Rebuild the position->user map from the per-user enrollment images on flash.
+// This is the durable per-feature record that survives the reset-on-mismatch:
+// esp-dl's valid features are in enrollment order, and each user's images were
+// written in that same order, so summing per-user image counts in id order
+// reconstructs which user owns each position. Returns true iff the reconstructed
+// total matches esp-dl's valid-feature count exactly (only then is it safe — a
+// legacy user with features but NO images can't be reconstructed this way).
+static bool featmap_rebuild_from_images(int db_feats)
+{
+    int total = 0;
+    for (int u = 0; u < MAX_ENROLL_USERS; u++) total += enroll_imgs_count_user(u);
+    if (total == 0 || total != db_feats) return false;
+
+    featmap_reset();
+    for (int u = 0; u < MAX_ENROLL_USERS; u++) {
+        int cnt = enroll_imgs_count_user(u);
+        for (int s = 0; s < cnt; s++) {
+            // stored_id here is just the running position; delete_feat needs the
+            // real esp-dl id, but after a rebuild we only need positions to be
+            // stable and users correct. next_stored_id is recomputed below.
+            featmap_append(u, (uint16_t)(s_feat_count + 1));
+        }
+    }
+    featmap_recompute_next_stored_id();
+    return true;
+}
+
 // Reusable RGB888 buffer in PSRAM. QVGA = 320*240*3 = 230400 bytes.
 static uint8_t *s_rgb_buf = nullptr;
 static const int FRAME_W = 320;
@@ -254,46 +287,61 @@ static void persist_encrypted_db(void)
 // own ArcFace. So during local enrollment we also persist each gate-passed VGA
 // JPEG (encrypted, like the DB). On a Mode 3 boot the sync layer decrypts these
 // and POSTs them to /enroll, giving both sides one face from one camera.
-//   /spiffs/enroll_NN.jpg.enc  (NN = 00..MAX_ENROLL_IMAGES-1)
+//   /spiffs/enroll_uUUU_SS.jpg.enc  (UUU = user_id 0..999, SS = sample 0..MAX-1)
 // These are ONLY written during enrollment and ONLY read when Mode 3 syncs;
 // local-only modes never touch the cloud, honouring the privacy boundary.
-#define MAX_ENROLL_IMAGES 8
-static int s_enroll_img_count = 0;   // how many were saved this enrollment
+// Per-user filenames (not a flat enroll_NN run) are what makes multi-user work:
+// an append-enroll for user B must not overwrite or re-push user A's images, and
+// the boot featmap can be rebuilt from each user's on-disk sample count.
+// (MAX_ENROLL_IMAGES / MAX_ENROLL_USERS defined near MAX_FEATURES at the top.)
 
-static void enroll_img_enc_path(int idx, char *out, size_t out_sz)
+static void enroll_img_enc_path(int user_id, int sample, char *out, size_t out_sz)
 {
-    snprintf(out, out_sz, "/spiffs/enroll_%02d.jpg.enc", idx);
+    snprintf(out, out_sz, "/spiffs/enroll_u%03d_%02d.jpg.enc", user_id, sample);
 }
 
-// Wipe any enrollment images from a previous enrollment so a fresh enroll is a
-// clean set (mirrors clear_all_feats() on the DB). Called at enroll start.
-// Only remove() files that actually EXIST: an unconditional remove() on a
-// missing path still forces SPIFFS to scan its object table, and 8 such scans
-// back-to-back at 40MHz flash starved the idle task -> task_wdt timeout. A
-// cheap fopen() existence check skips the misses, and we yield so the idle task
-// (and thus the watchdog) always gets serviced.
-static void enroll_imgs_clear(void)
+// How many enrollment images exist on flash for one user (contiguous run from 0).
+static int enroll_imgs_count_user(int user_id)
 {
-    char p[48];
-    for (int i = 0; i < MAX_ENROLL_IMAGES; i++) {
-        enroll_img_enc_path(i, p, sizeof(p));
+    int n = 0;
+    char p[64];
+    for (int s = 0; s < MAX_ENROLL_IMAGES; s++) {
+        enroll_img_enc_path(user_id, s, p, sizeof(p));
+        FILE *f = fopen(p, "rb");
+        if (f == nullptr) break;
+        fclose(f);
+        n++;
+    }
+    return n;
+}
+
+// Wipe ONE user's enrollment images (append-enroll for a fresh capture of the
+// same user replaces that user's set, never touching other users). Only remove()
+// files that EXIST: an unconditional remove() on a missing path forces a SPIFFS
+// object-table scan, and a burst of them starved the idle task -> task_wdt. A
+// cheap fopen() check skips misses; we yield so the watchdog is serviced.
+static void enroll_imgs_clear_user(int user_id)
+{
+    char p[64];
+    for (int s = 0; s < MAX_ENROLL_IMAGES; s++) {
+        enroll_img_enc_path(user_id, s, p, sizeof(p));
         FILE *f = fopen(p, "rb");
         if (f != nullptr) {
             fclose(f);
             remove(p);
         }
-        vTaskDelay(1);   // let IDLE/watchdog run between flash ops
+        vTaskDelay(1);
     }
-    s_enroll_img_count = 0;
 }
 
-// Persist one gate-passed enrollment JPEG as the next encrypted enroll image.
-// Writes plaintext to a temp path, encrypts to enroll_NN.jpg.enc, removes the
-// plaintext. Best-effort: a failure here must not abort enrollment (the local
-// DB is the primary; cloud sync is a bonus), so we log and move on.
-static void enroll_img_save(const uint8_t *jpeg, size_t len)
+// Persist one gate-passed enrollment JPEG at (user_id, sample). Writes plaintext
+// to a temp path, encrypts to the per-user path, removes the plaintext.
+// Best-effort: a failure here must not abort enrollment (the local DB is primary;
+// cloud sync is a bonus), so we log and move on.
+static void enroll_img_save(int user_id, int sample,
+                            const uint8_t *jpeg, size_t len)
 {
-    if (jpeg == nullptr || len == 0 || s_enroll_img_count >= MAX_ENROLL_IMAGES) {
+    if (jpeg == nullptr || len == 0 || sample < 0 || sample >= MAX_ENROLL_IMAGES) {
         return;
     }
     const char *tmp = "/spiffs/enroll_tmp.jpg";
@@ -310,15 +358,13 @@ static void enroll_img_save(const uint8_t *jpeg, size_t len)
         remove(tmp);
         return;
     }
-    char enc[48];
-    enroll_img_enc_path(s_enroll_img_count, enc, sizeof(enc));
+    char enc[64];
+    enroll_img_enc_path(user_id, sample, enc, sizeof(enc));
     esp_err_t err = crypto_ctrl_encrypt_file(tmp, enc);
     remove(tmp);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "  enroll-img: encrypt failed: %s", esp_err_to_name(err));
-        return;
     }
-    s_enroll_img_count++;
 }
 
 // Mount the "models" SPIFFS partition at /spiffs.
@@ -427,10 +473,22 @@ extern "C" esp_err_t face_ctrl_init(void)
     // count, the map is untrustworthy — reset it. Recognition then returns raw
     // positional ids until the next enroll rewrites the map.
     if (s_recognizer != nullptr && s_feat_count != s_recognizer->get_num_feats()) {
-        ESP_LOGW(TAG, "featmap count %d != db valid feats %d — resetting map",
-                 s_feat_count, s_recognizer->get_num_feats());
-        featmap_reset();
-        s_next_stored_id = 1;
+        int db_feats = s_recognizer->get_num_feats();
+        // Before wiping, try to rebuild the map from the per-user enroll images on
+        // flash — this is what stops a pre-existing user (whose templates predate
+        // the featmap format) from being demoted to raw positional ids on every
+        // boot. ponytail: assumes esp-dl feature order == on-disk image order,
+        // which holds because both are written in enrollment order and deletes
+        // remove images too; only mismatched totals fall back to the wipe.
+        if (featmap_rebuild_from_images(db_feats)) {
+            ESP_LOGI(TAG, "featmap rebuilt from images: %d features mapped",
+                     s_feat_count);
+        } else {
+            ESP_LOGW(TAG, "featmap count %d != db valid feats %d, no image record "
+                     "— resetting map", s_feat_count, db_feats);
+            featmap_reset();
+            s_next_stored_id = 1;
+        }
     }
 
     // In-memory self-test of the positional map bookkeeping. Logs PASS/FAIL.
@@ -645,7 +703,9 @@ extern "C" esp_err_t face_ctrl_enroll_multi(int id, int samples_wanted, int time
     s_recognizer->clear_all_feats();
     featmap_reset();  // feature ids restart at 1 after a clear
     s_next_stored_id = 1;
-    enroll_imgs_clear();  // drop previous enrollment's cloud-sync JPEGs too
+    // Keypad enroll is single-user + wipes the DB, so wipe every user's cloud-sync
+    // images too (scan the id space; cheap fopen misses are skipped).
+    for (int u = 0; u < MAX_ENROLL_USERS; u++) enroll_imgs_clear_user(u);
 
     int captured = 0;
     int64_t start_us = esp_timer_get_time();
@@ -702,7 +762,7 @@ extern "C" esp_err_t face_ctrl_enroll_multi(int id, int samples_wanted, int time
         // complete JPEG (detect_once only retains frames with a valid EOI) and
         // it's the same look we just embedded locally — so the cloud enrolls the
         // identical face from the identical camera. Best-effort; never fatal.
-        enroll_img_save(s_last_jpeg, s_last_jpeg_len);
+        enroll_img_save(id, captured, s_last_jpeg, s_last_jpeg_len);
         captured++;
         // Cleared DB -> position == stored id == running count. Shadow it.
         featmap_append(id, s_next_stored_id++);
@@ -729,8 +789,17 @@ extern "C" esp_err_t face_ctrl_enroll_append(int user_id, int samples_wanted, in
     }
     if (samples_wanted < 1) samples_wanted = 1;
 
-    // Append templates for user_id WITHOUT clearing — this is the multi-user
-    // path. (face_ctrl_enroll_multi clears first; this one does not.)
+    // Multi-user path: add user_id's templates WITHOUT wiping OTHER users. But a
+    // re-enroll of the SAME user must REPLACE, not stack (else duplicate templates
+    // pile up and skew matching, and the cloud — which deletes-then-repushes per
+    // user — would drift from us). So first drop this user's own old features and
+    // images, then capture fresh ones. Other users are untouched.
+    int purged = 0;
+    face_ctrl_delete_user(user_id, &purged);   // 0 if new user — fine
+    if (purged > 0) ESP_LOGI(TAG, "append-enroll: replaced %d old template(s) for user=%d",
+                             purged, user_id);
+    enroll_imgs_clear_user(user_id);
+
     int captured = 0;
     int64_t start_us = esp_timer_get_time();
     ESP_LOGI(TAG, "append-enroll user=%d: want %d samples (hold still)...",
@@ -764,7 +833,7 @@ extern "C" esp_err_t face_ctrl_enroll_append(int user_id, int samples_wanted, in
         }
         dl::image::img_t img = build_img();
         s_recognizer->enroll(img, s_last_results);
-        enroll_img_save(s_last_jpeg, s_last_jpeg_len);   // best-effort cloud copy
+        enroll_img_save(user_id, captured, s_last_jpeg, s_last_jpeg_len);
         captured++;
         featmap_append(user_id, s_next_stored_id++);
         ESP_LOGI(TAG, "  append sample %d/%d (pos %d id %d -> user %d)",
@@ -780,6 +849,43 @@ extern "C" esp_err_t face_ctrl_enroll_append(int user_id, int samples_wanted, in
     featmap_save();
     ESP_LOGI(TAG, "append-enroll done: %d templates for user=%d (total feats %d)",
              captured, user_id, s_feat_count);
+    return ESP_OK;
+}
+
+extern "C" esp_err_t face_ctrl_import_face(int user_id, int sample,
+                                           const uint8_t *jpeg, size_t len)
+{
+    // Enroll a face that came FROM the cloud (e.g. a user enrolled via the phone
+    // app that this device's camera never saw), so it also matches on the fast
+    // LOCAL pass — not only via a cloud round-trip. esp-dl and ArcFace embeddings
+    // aren't interchangeable, so we must re-embed the actual JPEG here.
+    if (s_recognizer == nullptr || s_detector == nullptr || s_rgb_buf == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (jpeg == nullptr || len < 4) return ESP_ERR_INVALID_ARG;
+    if (s_feat_count >= MAX_FEATURES) return ESP_ERR_NO_MEM;
+
+    if (decode_jpeg_to_rgb(jpeg, len) != ESP_OK) {
+        ESP_LOGW(TAG, "import user=%d sample=%d: JPEG decode failed", user_id, sample);
+        return ESP_FAIL;
+    }
+    dl::image::img_t img = build_img();
+    auto results = s_detector->run(img);
+    if (results.empty()) {
+        ESP_LOGW(TAG, "import user=%d sample=%d: no face in cloud image", user_id, sample);
+        return ESP_ERR_NOT_FOUND;
+    }
+    s_last_results = results;
+    s_have_last_results = true;
+    s_recognizer->enroll(img, s_last_results);
+    featmap_append(user_id, s_next_stored_id++);
+    // Keep a local encrypted copy so a reboot's featmap rebuild sees this user,
+    // and so we don't re-pull it next boot.
+    enroll_img_save(user_id, sample, jpeg, len);
+    persist_encrypted_db();
+    featmap_save();
+    ESP_LOGI(TAG, "imported cloud face: user=%d sample=%d (total feats %d)",
+             user_id, sample, s_feat_count);
     return ESP_OK;
 }
 
@@ -809,6 +915,9 @@ extern "C" esp_err_t face_ctrl_delete_user(int user_id, int *out_deleted)
         persist_encrypted_db();
         featmap_save();
     }
+    // Drop this user's cloud-sync images too, so the boot featmap rebuild (which
+    // reads per-user image counts) doesn't resurrect a deleted user.
+    enroll_imgs_clear_user(user_id);
     ESP_LOGI(TAG, "delete_user %d: removed %d feature(s), %d remain",
              user_id, deleted, s_feat_count);
     return ESP_OK;   // idempotent: 0 removed is not an error
@@ -901,30 +1010,32 @@ extern "C" esp_err_t face_ctrl_get_last_jpeg(const uint8_t **out_buf, size_t *ou
     return ESP_OK;
 }
 
-extern "C" int face_ctrl_enroll_image_count(void)
+extern "C" int face_ctrl_enroll_image_count(int user_id)
 {
-    // Scan flash rather than trust s_enroll_img_count: after a reboot the counter
-    // resets to 0 but the encrypted images persist, and Mode 3 sync runs post-boot.
-    // Count the contiguous run of enroll_NN.jpg.enc from 0.
+    // Scan flash rather than trust a RAM counter: after a reboot the images
+    // persist and Mode 3 sync runs post-boot. Per-user contiguous run from 0.
+    return enroll_imgs_count_user(user_id);
+}
+
+extern "C" int face_ctrl_enrolled_user_ids(int *out_ids, int max)
+{
+    // List every user with at least one enrollment image on flash. The sync layer
+    // uses this to push each user's own faces (never a flat 'everyone as user 0').
     int n = 0;
-    char p[48];
-    for (int i = 0; i < MAX_ENROLL_IMAGES; i++) {
-        enroll_img_enc_path(i, p, sizeof(p));
-        FILE *f = fopen(p, "rb");
-        if (f == nullptr) break;   // first gap ends the set
-        fclose(f);
-        n++;
+    for (int u = 0; u < MAX_ENROLL_USERS && n < max; u++) {
+        if (enroll_imgs_count_user(u) > 0) out_ids[n++] = u;
     }
     return n;
 }
 
-extern "C" esp_err_t face_ctrl_enroll_image_decrypt(int idx, const char *out_path)
+extern "C" esp_err_t face_ctrl_enroll_image_decrypt(int user_id, int sample,
+                                                    const char *out_path)
 {
-    if (out_path == nullptr || idx < 0 || idx >= MAX_ENROLL_IMAGES) {
+    if (out_path == nullptr || sample < 0 || sample >= MAX_ENROLL_IMAGES) {
         return ESP_ERR_INVALID_ARG;
     }
-    char enc[48];
-    enroll_img_enc_path(idx, enc, sizeof(enc));
+    char enc[64];
+    enroll_img_enc_path(user_id, sample, enc, sizeof(enc));
     FILE *f = fopen(enc, "rb");
     if (f == nullptr) return ESP_ERR_NOT_FOUND;
     fclose(f);
