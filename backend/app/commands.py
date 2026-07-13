@@ -11,6 +11,11 @@ CMD_HMAC_SECRET = os.environ.get("CMD_HMAC_SECRET", "00" * 32)
 def build_command(device_id: str, type_: str, args: dict | None = None,
                   ttl_s: int = 8) -> dict:
     args = args or {}
+    # The firmware re-serializes the received args to recompute the signature,
+    # preserving received key order. sign_command hashes the sort_keys=True form,
+    # so the wire args must ship in that same sorted order or multi-key commands
+    # fail bad_sig (empty args are order-free, which hid this through phase 1).
+    args = dict(sorted(args.items()))
     nonce = security.new_nonce()
     iat = int(time.time())
     exp = iat + ttl_s
