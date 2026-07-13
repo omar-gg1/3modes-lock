@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException, Response
 
 from . import face_engine, storage
 
@@ -100,7 +100,8 @@ async def enroll(
     x_api_key: str | None = Header(default=None),
 ):
     _check_key(x_api_key)
-    img = _decode_image(await image.read())
+    raw = await image.read()
+    img = _decode_image(raw)
     try:
         emb, quality = face_engine.embed_largest_face(img)
     except Exception as e:
@@ -118,7 +119,8 @@ async def enroll(
     if quality["num_faces"] > 1:
         warnings.append("multiple_faces_used_largest")
 
-    storage.save_encoding(user_id, name, emb, source, quality["det_score"])
+    storage.save_encoding(user_id, name, emb, source, quality["det_score"],
+                          image=raw)
     log.info("enrolled user_id=%s name=%s source=%s det=%.3f warnings=%s",
              user_id, name, source, quality["det_score"], warnings)
     return {"enrolled": True, "user_id": user_id, "name": name,
@@ -166,6 +168,35 @@ async def verify(
 def encodings(x_api_key: str | None = Header(default=None)):
     _check_key(x_api_key)
     return {"total_encodings": storage.count_encodings()}
+
+
+# ---- Sync surface for the ESP (cloud -> device pull) ---------------------
+# The ESP polls /faces/revision on boot; if it changed since its last sync it
+# lists /faces, and for any face it doesn't hold locally it pulls the JPEG from
+# /faces/{id}/image and re-enrolls it in its own recognizer. Replaces the old
+# blind "re-push everything as user 0 on every boot" sync that collapsed all
+# users into one gallery.
+
+@app.get("/faces/revision")
+def faces_revision(x_api_key: str | None = Header(default=None)):
+    _check_key(x_api_key)
+    return storage.faces_revision()
+
+
+@app.get("/faces")
+def faces(x_api_key: str | None = Header(default=None)):
+    _check_key(x_api_key)
+    return [{"id": i, "user_id": u, "name": n, "source": s}
+            for (i, u, n, s) in storage.list_encodings_meta()]
+
+
+@app.get("/faces/{enc_id}/image")
+def face_image(enc_id: int, x_api_key: str | None = Header(default=None)):
+    _check_key(x_api_key)
+    img = storage.get_encoding_image(enc_id)
+    if img is None:
+        raise HTTPException(404, "no image for that encoding")
+    return Response(content=img, media_type="image/jpeg")
 
 
 @app.delete("/encodings")

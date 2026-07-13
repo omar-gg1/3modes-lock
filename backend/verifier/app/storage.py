@@ -10,7 +10,8 @@ import time
 
 import numpy as np
 from sqlalchemy import (create_engine, Column, Integer, String, DateTime,
-                        LargeBinary, select)
+                        LargeBinary, func, select, text)
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timezone
@@ -41,6 +42,12 @@ class FaceEncoding(Base):
     source = Column(String(16), default="app")
     det_score = Column(String(16))            # detector confidence at enroll
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # The original enrollment JPEG. Kept so the ESP can PULL a cloud-enrolled
+    # face (e.g. enrolled from the phone app) and re-embed it with its own local
+    # recognizer — esp-dl and ArcFace embeddings are not interchangeable, so we
+    # must ship the image, not the embedding, to seed the local matcher.
+    # MEDIUMBLOB (16 MB) on MySQL; plain BLOB on SQLite (tests) via the variant.
+    image = Column(LargeBinary().with_variant(MEDIUMBLOB(), "mysql"))
 
 
 def wait_for_db(max_wait_s: int = 60) -> None:
@@ -60,6 +67,19 @@ def wait_for_db(max_wait_s: int = 60) -> None:
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # create_all only creates missing TABLES, never adds a column to a table that
+    # already exists. Add `image` to a pre-existing face_encodings idempotently.
+    if _is_sqlite:
+        col_type, exists_sql = "BLOB", (
+            "SELECT 1 FROM pragma_table_info('face_encodings') WHERE name='image'")
+    else:
+        col_type, exists_sql = "MEDIUMBLOB", (
+            "SELECT 1 FROM information_schema.columns WHERE table_schema=DATABASE()"
+            " AND table_name='face_encodings' AND column_name='image'")
+    with engine.begin() as conn:
+        if conn.execute(text(exists_sql)).first() is None:
+            conn.execute(text(f"ALTER TABLE face_encodings ADD COLUMN image {col_type}"))
+            log.info("added face_encodings.image column")
 
 
 def encoding_to_blob(emb: np.ndarray) -> bytes:
@@ -71,16 +91,54 @@ def blob_to_encoding(blob: bytes) -> np.ndarray:
 
 
 def save_encoding(user_id: int, name: str, emb: np.ndarray,
-                  source: str, det_score: float) -> None:
+                  source: str, det_score: float,
+                  image: bytes | None = None) -> None:
     s = SessionLocal()
     try:
         row = FaceEncoding(
             user_id=user_id, name=name,
             encoding=encoding_to_blob(emb),
             source=source, det_score=f"{det_score:.3f}",
+            image=image,
         )
         s.add(row)
         s.commit()
+    finally:
+        s.close()
+
+
+def faces_revision() -> dict:
+    """Cheap monotonic revision token for the whole gallery. count changes on any
+    insert/delete; max_id changes on any insert (ids never reused). The ESP GETs
+    this on boot and only reconciles when it differs from its last-synced value —
+    replacing the old blind 35s re-push-everything boot sync."""
+    s = SessionLocal()
+    try:
+        count = s.query(func.count(FaceEncoding.id)).scalar() or 0
+        max_id = s.query(func.max(FaceEncoding.id)).scalar() or 0
+        return {"count": int(count), "max_id": int(max_id)}
+    finally:
+        s.close()
+
+
+def list_encodings_meta():
+    """[(id, user_id, name, source), ...] — no blobs. Lets the ESP diff which
+    faces it already holds locally before pulling images."""
+    s = SessionLocal()
+    try:
+        rows = s.execute(
+            select(FaceEncoding.id, FaceEncoding.user_id,
+                   FaceEncoding.name, FaceEncoding.source)).all()
+        return [(r.id, r.user_id, r.name, r.source) for r in rows]
+    finally:
+        s.close()
+
+
+def get_encoding_image(enc_id: int) -> bytes | None:
+    s = SessionLocal()
+    try:
+        row = s.get(FaceEncoding, enc_id)
+        return bytes(row.image) if row and row.image else None
     finally:
         s.close()
 
