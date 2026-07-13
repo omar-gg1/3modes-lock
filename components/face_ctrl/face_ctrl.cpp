@@ -40,29 +40,71 @@ typedef enum {
 } detect_fail_t;
 static detect_fail_t s_last_detect_fail = DETECT_FAIL_NONE;
 
-// ---- Feature-ID -> User-ID mapping ----
-// The esp-dl recognizer assigns every enrolled FEATURE its own sequential id
-// (1,2,3,...) and has NO notion of "these N features are the same person". So
-// when we store 5 templates for one user, the recognizer sees ids 1..5 and
-// recognition returns whichever template matched — giving a meaningless,
-// changing id for the same face. We fix that here: map each feature id to the
-// real user id it was enrolled under. s_feat_user_map[feature_id] = user_id.
-// Index 0 is unused (recognizer ids start at 1). Persisted next to the DB so it
-// survives reboots, and encrypted along with everything else at rest.
+// ---- Feature position -> User-ID map (see design phase 2) ----
+// esp-dl's query_feat() returns the 1-BASED POSITION of the match in its
+// in-memory list of VALID features, NOT the stored feature id. Deletes tombstone
+// a feature and compact that list, so positions shift. We therefore shadow the
+// recognizer's valid list here, in the SAME order:
+//   s_feat_users[pos]      = the user_id that owns the feature at that position
+//   s_feat_stored_ids[pos] = esp-dl's stored id for it (needed by delete_feat)
+// pos is 1-based to match query_feat; index 0 is unused. Persisted encrypted
+// next to the DB and kept in lockstep with it on every enroll/delete.
 #define MAX_FEATURES 64
-static int16_t s_feat_user_map[MAX_FEATURES + 1];
-static int     s_feat_count = 0;   // number of features enrolled so far
+#define FEATMAP_MAGIC 0x4E464D32u   // "NFM2" — bump if the on-disk format changes
+static int16_t  s_feat_users[MAX_FEATURES + 1];
+static uint16_t s_feat_stored_ids[MAX_FEATURES + 1];
+static int      s_feat_count = 0;   // number of valid features shadowed
 static const char *FEATMAP_PATH     = "/spiffs/featmap.bin";
 static const char *FEATMAP_ENC_PATH = "/spiffs/featmap.bin.enc";
 
+// esp-dl assigns each enrolled feature stored id = ++num_feats_total (never
+// reused, even after tombstone deletes). We can't read num_feats_total back
+// (no getter), so we track the next id ourselves: max stored id seen, + 1.
+static uint16_t s_next_stored_id = 1;
+
 static void featmap_reset(void)
 {
-    for (int i = 0; i <= MAX_FEATURES; i++) s_feat_user_map[i] = -1;
+    for (int i = 0; i <= MAX_FEATURES; i++) {
+        s_feat_users[i] = -1;
+        s_feat_stored_ids[i] = 0;
+    }
     s_feat_count = 0;
 }
 
-// Persist the map (plaintext temp -> encrypted at rest), mirroring how the face
-// DB itself is handled.
+static void featmap_recompute_next_stored_id(void)
+{
+    uint16_t mx = 0;
+    for (int i = 1; i <= s_feat_count; i++)
+        if (s_feat_stored_ids[i] > mx) mx = s_feat_stored_ids[i];
+    s_next_stored_id = mx + 1;
+}
+
+// Append one feature at the next position (mirrors esp-dl enroll appending at
+// the end of its list). stored_id is what enroll_feat assigned.
+static void featmap_append(int user_id, uint16_t stored_id)
+{
+    if (s_feat_count >= MAX_FEATURES) return;
+    s_feat_count++;
+    s_feat_users[s_feat_count] = (int16_t) user_id;
+    s_feat_stored_ids[s_feat_count] = stored_id;
+}
+
+// Remove the entry at 1-based position `pos` and shift the tail down by one,
+// mirroring m_feats.erase() compacting the valid list.
+static void featmap_remove_position(int pos)
+{
+    if (pos < 1 || pos > s_feat_count) return;
+    for (int i = pos; i < s_feat_count; i++) {
+        s_feat_users[i] = s_feat_users[i + 1];
+        s_feat_stored_ids[i] = s_feat_stored_ids[i + 1];
+    }
+    s_feat_users[s_feat_count] = -1;
+    s_feat_stored_ids[s_feat_count] = 0;
+    s_feat_count--;
+}
+
+// Persist both parallel arrays + count, prefixed with a magic/version word so a
+// pre-phase-2 map (which had a different layout) is detected and discarded.
 static void featmap_save(void)
 {
     FILE *f = fopen(FEATMAP_PATH, "wb");
@@ -70,14 +112,18 @@ static void featmap_save(void)
         ESP_LOGE(TAG, "featmap: cannot open for write");
         return;
     }
+    uint32_t magic = FEATMAP_MAGIC;
+    fwrite(&magic, sizeof(magic), 1, f);
     fwrite(&s_feat_count, sizeof(s_feat_count), 1, f);
-    fwrite(s_feat_user_map, sizeof(int16_t), MAX_FEATURES + 1, f);
+    fwrite(s_feat_users, sizeof(int16_t), MAX_FEATURES + 1, f);
+    fwrite(s_feat_stored_ids, sizeof(uint16_t), MAX_FEATURES + 1, f);
     fclose(f);
     crypto_ctrl_encrypt_file(FEATMAP_PATH, FEATMAP_ENC_PATH);
 }
 
-// Load the map from the encrypted companion file. Resets to empty if missing or
-// if authentication fails (mirrors the face-DB tamper handling).
+// Load the map. Resets to empty (and logs) on any mismatch: missing file, failed
+// decrypt, wrong magic (old format), or short read. Caller (init) reconciles
+// s_feat_count against the DB's get_num_feats() afterwards.
 static void featmap_load(void)
 {
     featmap_reset();
@@ -91,13 +137,20 @@ static void featmap_load(void)
     }
     FILE *f = fopen(FEATMAP_PATH, "rb");
     if (!f) return;
-    if (fread(&s_feat_count, sizeof(s_feat_count), 1, f) != 1) {
-        s_feat_count = 0;
-    }
-    if (fread(s_feat_user_map, sizeof(int16_t), MAX_FEATURES + 1, f) != (size_t)(MAX_FEATURES + 1)) {
-        featmap_reset();
-    }
+    uint32_t magic = 0;
+    bool ok = fread(&magic, sizeof(magic), 1, f) == 1 && magic == FEATMAP_MAGIC;
+    if (ok) ok = fread(&s_feat_count, sizeof(s_feat_count), 1, f) == 1;
+    if (ok) ok = fread(s_feat_users, sizeof(int16_t), MAX_FEATURES + 1, f)
+                 == (size_t)(MAX_FEATURES + 1);
+    if (ok) ok = fread(s_feat_stored_ids, sizeof(uint16_t), MAX_FEATURES + 1, f)
+                 == (size_t)(MAX_FEATURES + 1);
     fclose(f);
+    if (!ok) {
+        ESP_LOGW(TAG, "featmap old/short/bad format — starting empty");
+        featmap_reset();
+        return;
+    }
+    featmap_recompute_next_stored_id();
     ESP_LOGI(TAG, "featmap loaded: %d features mapped", s_feat_count);
 }
 
@@ -369,6 +422,20 @@ extern "C" esp_err_t face_ctrl_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    // Guard against map/DB drift (e.g. a crash between the DB write and the map
+    // write): if the shadowed count disagrees with the recognizer's actual valid
+    // count, the map is untrustworthy — reset it. Recognition then returns raw
+    // positional ids until the next enroll rewrites the map.
+    if (s_recognizer != nullptr && s_feat_count != s_recognizer->get_num_feats()) {
+        ESP_LOGW(TAG, "featmap count %d != db valid feats %d — resetting map",
+                 s_feat_count, s_recognizer->get_num_feats());
+        featmap_reset();
+        s_next_stored_id = 1;
+    }
+
+    // In-memory self-test of the positional map bookkeeping. Logs PASS/FAIL.
+    face_ctrl_featmap_selftest();
+
     ESP_LOGI(TAG, "initialized. RGB buf @ %p, detector @ %p, recognizer @ %p",
              s_rgb_buf, s_detector, s_recognizer);
     ESP_LOGI(TAG, "free PSRAM after init: %u bytes",
@@ -577,6 +644,7 @@ extern "C" esp_err_t face_ctrl_enroll_multi(int id, int samples_wanted, int time
     // delete only the target user's features instead of clearing everything.
     s_recognizer->clear_all_feats();
     featmap_reset();  // feature ids restart at 1 after a clear
+    s_next_stored_id = 1;
     enroll_imgs_clear();  // drop previous enrollment's cloud-sync JPEGs too
 
     int captured = 0;
@@ -636,13 +704,9 @@ extern "C" esp_err_t face_ctrl_enroll_multi(int id, int samples_wanted, int time
         // identical face from the identical camera. Best-effort; never fatal.
         enroll_img_save(s_last_jpeg, s_last_jpeg_len);
         captured++;
-        // The recognizer just assigned this feature the id == s_feat_count+1
-        // (sequential after the clear). Record that it belongs to this user.
-        s_feat_count++;
-        if (s_feat_count <= MAX_FEATURES) {
-            s_feat_user_map[s_feat_count] = (int16_t) id;
-        }
-        ESP_LOGI(TAG, "  captured sample %d/%d (feat id %d -> user %d)",
+        // Cleared DB -> position == stored id == running count. Shadow it.
+        featmap_append(id, s_next_stored_id++);
+        ESP_LOGI(TAG, "  captured sample %d/%d (pos/id %d -> user %d)",
                  captured, samples_wanted, s_feat_count, id);
     }
 
@@ -655,6 +719,138 @@ extern "C" esp_err_t face_ctrl_enroll_multi(int id, int samples_wanted, int time
     featmap_save();  // keep the id map in sync with the DB
     ESP_LOGI(TAG, "multi-enroll done: %d templates stored for user id=%d", captured, id);
     return ESP_OK;
+}
+
+extern "C" esp_err_t face_ctrl_enroll_append(int user_id, int samples_wanted, int timeout_ms)
+{
+    if (s_recognizer == nullptr) {
+        ESP_LOGE(TAG, "not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (samples_wanted < 1) samples_wanted = 1;
+
+    // Append templates for user_id WITHOUT clearing — this is the multi-user
+    // path. (face_ctrl_enroll_multi clears first; this one does not.)
+    int captured = 0;
+    int64_t start_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "append-enroll user=%d: want %d samples (hold still)...",
+             user_id, samples_wanted);
+    int bad_jpeg = 0, no_face = 0, no_frame = 0, gate_rejects = 0, iters = 0;
+
+    while (captured < samples_wanted) {
+        if ((esp_timer_get_time() - start_us) / 1000 > timeout_ms) {
+            ESP_LOGW(TAG, "append-enroll timed out %d/%d (iters=%d bad_jpeg=%d "
+                     "no_face=%d no_frame=%d gate=%d)", captured, samples_wanted,
+                     iters, bad_jpeg, no_face, no_frame, gate_rejects);
+            break;
+        }
+        iters++;
+        vTaskDelay(pdMS_TO_TICKS(ENROLL_FRAME_INTERVAL_MS));
+        if (!face_ctrl_detect_once()) {
+            switch (s_last_detect_fail) {
+                case DETECT_FAIL_BAD_JPEG: bad_jpeg++; break;
+                case DETECT_FAIL_NO_FRAME: no_frame++; break;
+                default:                   no_face++;  break;
+            }
+            continue;
+        }
+        if (!last_detection_passes(FACE_ENROLL_MIN_SCORE, FACE_ENROLL_MIN_BOX_FRAC)) {
+            gate_rejects++;
+            continue;
+        }
+        if (s_feat_count >= MAX_FEATURES) {
+            ESP_LOGW(TAG, "append-enroll: feature store full (%d)", MAX_FEATURES);
+            break;
+        }
+        dl::image::img_t img = build_img();
+        s_recognizer->enroll(img, s_last_results);
+        enroll_img_save(s_last_jpeg, s_last_jpeg_len);   // best-effort cloud copy
+        captured++;
+        featmap_append(user_id, s_next_stored_id++);
+        ESP_LOGI(TAG, "  append sample %d/%d (pos %d id %d -> user %d)",
+                 captured, samples_wanted, s_feat_count,
+                 s_feat_stored_ids[s_feat_count], user_id);
+    }
+
+    if (captured == 0) {
+        ESP_LOGW(TAG, "append-enroll captured nothing — no good face");
+        return ESP_ERR_NOT_FOUND;
+    }
+    persist_encrypted_db();
+    featmap_save();
+    ESP_LOGI(TAG, "append-enroll done: %d templates for user=%d (total feats %d)",
+             captured, user_id, s_feat_count);
+    return ESP_OK;
+}
+
+extern "C" esp_err_t face_ctrl_delete_user(int user_id, int *out_deleted)
+{
+    if (s_recognizer == nullptr) {
+        ESP_LOGE(TAG, "not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    int deleted = 0;
+    // Walk positions from the TOP down so removing one doesn't shift positions
+    // we haven't examined yet. delete_feat needs the esp-dl STORED id, which we
+    // kept in s_feat_stored_ids alongside the user mapping.
+    for (int pos = s_feat_count; pos >= 1; pos--) {
+        if (s_feat_users[pos] == (int16_t) user_id) {
+            uint16_t stored = s_feat_stored_ids[pos];
+            if (s_recognizer->delete_feat(stored) == ESP_OK) {
+                featmap_remove_position(pos);
+                deleted++;
+            } else {
+                ESP_LOGW(TAG, "delete_feat(stored=%d) failed", stored);
+            }
+        }
+    }
+    if (out_deleted) *out_deleted = deleted;
+    if (deleted > 0) {
+        persist_encrypted_db();
+        featmap_save();
+    }
+    ESP_LOGI(TAG, "delete_user %d: removed %d feature(s), %d remain",
+             user_id, deleted, s_feat_count);
+    return ESP_OK;   // idempotent: 0 removed is not an error
+}
+
+extern "C" bool face_ctrl_featmap_selftest(void)
+{
+    // Snapshot real state so the test doesn't disturb a loaded map.
+    static int16_t  save_u[MAX_FEATURES + 1];
+    static uint16_t save_s[MAX_FEATURES + 1];
+    memcpy(save_u, s_feat_users, sizeof(save_u));
+    memcpy(save_s, s_feat_stored_ids, sizeof(save_s));
+    int save_count = s_feat_count;
+    uint16_t save_next = s_next_stored_id;
+
+    bool pass = true;
+    featmap_reset();
+    s_next_stored_id = 1;
+
+    // enroll user 7 (2 feats: stored 1,2), user 9 (1 feat: stored 3)
+    featmap_append(7, s_next_stored_id++);
+    featmap_append(7, s_next_stored_id++);
+    featmap_append(9, s_next_stored_id++);
+    pass &= (s_feat_count == 3);
+    pass &= (s_feat_users[1] == 7 && s_feat_users[2] == 7 && s_feat_users[3] == 9);
+    pass &= (s_feat_stored_ids[1] == 1 && s_feat_stored_ids[3] == 3);
+
+    // delete user 7 (positions 2 then 1, top-down) -> only user 9 survives at pos 1
+    for (int pos = s_feat_count; pos >= 1; pos--)
+        if (s_feat_users[pos] == 7) featmap_remove_position(pos);
+    pass &= (s_feat_count == 1);
+    pass &= (s_feat_users[1] == 9);
+    pass &= (s_feat_stored_ids[1] == 3);   // survivor keeps its ORIGINAL stored id
+
+    // restore real state
+    memcpy(s_feat_users, save_u, sizeof(save_u));
+    memcpy(s_feat_stored_ids, save_s, sizeof(save_s));
+    s_feat_count = save_count;
+    s_next_stored_id = save_next;
+
+    ESP_LOGI(TAG, "featmap self-test: %s", pass ? "PASS" : "FAIL");
+    return pass;
 }
 
 extern "C" esp_err_t face_ctrl_recognize(int *out_id, float *out_similarity)
@@ -677,14 +873,15 @@ extern "C" esp_err_t face_ctrl_recognize(int *out_id, float *out_similarity)
         return ESP_ERR_NOT_FOUND;
     }
 
-    // We only care about the first detected face. Translate the recognizer's
-    // internal FEATURE id back to the real USER id via the map, so the same
-    // person always reports the same id regardless of which template matched.
+    // We only care about the first detected face. query_feat returns the 1-based
+    // POSITION in the valid list, which we translate to the real USER id via the
+    // positional map, so the same person always reports the same id regardless of
+    // which template matched (and it stays correct after deletes).
     auto &top = results.front();
-    int feat_id = top.id;
-    int user_id = feat_id;  // fallback if unmapped
-    if (feat_id >= 1 && feat_id <= MAX_FEATURES && s_feat_user_map[feat_id] >= 0) {
-        user_id = s_feat_user_map[feat_id];
+    int position = top.id;   // 1-based position, NOT a stored feature id
+    int user_id = position;  // fallback if unmapped
+    if (position >= 1 && position <= s_feat_count && s_feat_users[position] >= 0) {
+        user_id = s_feat_users[position];
     }
     *out_id = user_id;
     *out_similarity = top.similarity;

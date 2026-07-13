@@ -15,6 +15,7 @@
 #include "liveness_ctrl.h"
 #include "mqtt_ctrl.h"
 #include "cloud_verify_ctrl.h"
+#include "enroll_request.h"
 #include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
@@ -329,6 +330,31 @@ void app_main(void) {
             if (elapsed_ms > ENROLLMENT_TIMEOUT_MS) {
                 enrollment_armed = false;
                 ESP_LOGI(TAG, "Enrollment timed out — no face detected");
+            }
+        }
+
+        // Remotely-armed append-enroll (from an append_enroll command). Runs the
+        // same blocking capture as the keypad path, but targeted at a specific
+        // user_id and WITHOUT wiping existing users.
+        {
+            int req_user = 0, req_samples = 0;
+            if (enroll_request_take(&req_user, &req_samples)) {
+                ESP_LOGI(TAG, ">>> remote append-enroll user=%d samples=%d",
+                         req_user, req_samples);
+                if (face_ctrl_detect_once()) {
+                    esp_err_t er = face_ctrl_enroll_append(req_user, req_samples,
+                                                           ENROLL_CAPTURE_MS);
+                    bool ok = (er == ESP_OK);
+                    ESP_LOGI(TAG, ">>> append-enroll user=%d %s",
+                             req_user, ok ? "OK" : "FAILED");
+                    mqtt_ctrl_publish_event(MQTT_METHOD_FACE, req_user, NAN, ok);
+                } else {
+                    ESP_LOGW(TAG, "append-enroll: no face to start capture");
+                    mqtt_ctrl_publish_event(MQTT_METHOD_FACE, req_user, NAN, false);
+                }
+                face_state = FACE_SCANNING;
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
             }
         }
 

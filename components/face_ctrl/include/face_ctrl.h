@@ -136,6 +136,30 @@ esp_err_t face_ctrl_recognize(int *out_id, float *out_similarity);
 esp_err_t face_ctrl_get_keypoints(int *out_keypoints, int max, int *out_count);
 
 /**
+ * @brief Append-enroll a face under @p user_id WITHOUT wiping existing users.
+ *        Same quality-gated multi-sample capture as face_ctrl_enroll_multi, but
+ *        it adds to the DB instead of clearing it first. Use for multi-user.
+ * @return ESP_OK if >=1 template stored, ESP_ERR_NOT_FOUND if no good face.
+ */
+esp_err_t face_ctrl_enroll_append(int user_id, int samples_wanted, int timeout_ms);
+
+/**
+ * @brief Remove every face feature belonging to @p user_id from the recognizer.
+ * @param out_deleted Optional: receives how many features were removed (0 if the
+ *                    user had none — still ESP_OK; delete is idempotent).
+ * @return ESP_OK on success (including the 0-removed no-op).
+ */
+esp_err_t face_ctrl_delete_user(int user_id, int *out_deleted);
+
+/**
+ * @brief Boot self-test of the positional feature->user map bookkeeping.
+ *        Runs pure in-memory (no camera/DB): simulates enroll/delete sequences
+ *        and asserts the map stays consistent. Logs PASS/FAIL over serial.
+ * @return true if all assertions held.
+ */
+bool face_ctrl_featmap_selftest(void);
+
+/**
  * @brief Cleanup. Not strictly needed but exposed for completeness.
  */
 void face_ctrl_deinit(void);

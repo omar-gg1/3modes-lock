@@ -14,6 +14,8 @@
 
 #include "cmd_verify.h"
 #include "lock_ctrl.h"
+#include "enroll_request.h"
+#include "face_ctrl.h"
 
 // Broker + identity live in a gitignored header (SSID/pass are used by the
 // caller for Wi-Fi; we use the broker fields + device id here). See
@@ -198,6 +200,29 @@ static void handle_command(const char *json, int len)
     } else if (strcmp(type, "unlock") == 0) {
         lock_ctrl_trigger_unlock("app command");
         publish_ack(nonce, "ok", "unlocked");
+    } else if (strcmp(type, "delete_user") == 0) {
+        const cJSON *juid = cJSON_GetObjectItem(jargs, "user_id");
+        if (!cJSON_IsNumber(juid)) {
+            publish_ack(nonce, "error", "bad_args");
+        } else {
+            int deleted = 0;
+            face_ctrl_delete_user((int) juid->valuedouble, &deleted);
+            publish_ack(nonce, "ok", "deleted");
+        }
+    } else if (strcmp(type, "append_enroll") == 0) {
+        const cJSON *juid = cJSON_GetObjectItem(jargs, "user_id");
+        if (!cJSON_IsNumber(juid)) {
+            publish_ack(nonce, "error", "bad_args");
+        } else {
+            const cJSON *jsamp = cJSON_GetObjectItem(jargs, "samples");
+            int samples = cJSON_IsNumber(jsamp) ? (int) jsamp->valuedouble : 5;
+            // Enrollment is a blocking multi-second capture — it CANNOT run in
+            // the MQTT task (would block acks + trip the task watchdog). Hand it
+            // to the main loop and ack that we've armed it. Enroll success is
+            // reported later as a normal access event, not this ack.
+            enroll_request_set((int) juid->valuedouble, samples);
+            publish_ack(nonce, "ok", "arming");
+        }
     } else {
         publish_ack(nonce, "error", "unknown_type");
     }
