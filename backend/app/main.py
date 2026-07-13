@@ -112,10 +112,10 @@ class CommandIn(BaseModel):
     args: dict = {}
 
 
-@app.post("/devices/{device_id}/commands", response_model=CommandOut)
-async def send_command(device_id: str, body: CommandIn,
-                       _sub: str = Depends(require_auth)):
-    cmd = commands.build_command(device_id, body.type, body.args)
+async def _dispatch_command(device_id: str, type_: str, args: dict) -> CommandOut:
+    """Shared publish -> await-ack path. Every command endpoint routes through
+    here so the nonce/ack correlation lives in exactly one place."""
+    cmd = commands.build_command(device_id, type_, args)
     fut = commands.registry.register(cmd["nonce"])
     commands.registry.track(cmd["nonce"], device_id)
     mqtt_client.publish(f"smartlock/{device_id}/commands", cmd)
@@ -125,6 +125,12 @@ async def send_command(device_id: str, body: CommandIn,
         return CommandOut(nonce=cmd["nonce"], result="timeout", detail="no_ack")
     return CommandOut(nonce=cmd["nonce"], result=ack["result"],
                       detail=ack["detail"])
+
+
+@app.post("/devices/{device_id}/commands", response_model=CommandOut)
+async def send_command(device_id: str, body: CommandIn,
+                       _sub: str = Depends(require_auth)):
+    return await _dispatch_command(device_id, body.type, body.args)
 
 
 @app.websocket("/ws")
@@ -271,3 +277,33 @@ def delete_user(user_id: int, db: Session = Depends(get_db),
         raise HTTPException(status_code=404, detail="user not found")
     db.delete(user)
     db.commit()
+
+
+# --- User management phase 2: face enroll / delete via the device ---
+
+class EnrollFaceIn(BaseModel):
+    device_id: str
+    samples: int = 5
+
+
+@app.post("/users/{user_id}/enroll", response_model=CommandOut)
+async def enroll_user_face(user_id: int, body: EnrollFaceIn,
+                           db: Session = Depends(get_db),
+                           _sub: str = Depends(require_auth)):
+    """Ask the device to append-enroll a face under this user_id (non-wiping).
+    The ack reports arming; enroll success arrives later as an access event."""
+    if db.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return await _dispatch_command(body.device_id, "append_enroll",
+                                   {"user_id": user_id, "samples": body.samples})
+
+
+@app.delete("/users/{user_id}/face", response_model=CommandOut)
+async def delete_user_face(user_id: int, device_id: str,
+                           db: Session = Depends(get_db),
+                           _sub: str = Depends(require_auth)):
+    """Ask the device to remove this user's face features. Distinct from
+    DELETE /users/{id}, which removes the DB row."""
+    if db.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return await _dispatch_command(device_id, "delete_user", {"user_id": user_id})
