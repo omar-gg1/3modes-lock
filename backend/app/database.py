@@ -126,6 +126,19 @@ class WifiStatus(Base):
                         onupdate=lambda: datetime.now(timezone.utc))
 
 
+class DeviceMode(Base):
+    """The lock's runtime operating mode (1=Local, 2=Hybrid, 3=Cloud-Assisted).
+    One row per device. Device is the source of truth; this copy is upserted only
+    after the lock acks a set_mode ok, so the app reflects the device's real mode.
+    """
+    __tablename__ = "device_modes"
+
+    device_id = Column(String(64), primary_key=True)
+    mode = Column(Integer, default=3)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+
 class User(Base):
     """A named person the lock recognizes, keyed to the firmware's user_id.
 

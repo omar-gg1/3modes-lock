@@ -28,9 +28,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import mqtt_client, security, reachability, commands
-from .database import SessionLocal, AccessEvent, User, DoorCode, ConfirmCode, WifiStatus, init_db, wait_for_db
+from .database import (SessionLocal, AccessEvent, User, DoorCode, ConfirmCode,
+                       WifiStatus, DeviceMode, init_db, wait_for_db)
 from .schemas import (AccessEventOut, LoginIn, TokenOut, DeviceStatusOut,
-                      CommandOut, UserIn, UserUpdate, UserOut)
+                      CommandOut, UserIn, UserUpdate, UserOut, ModeIn, ModeOut)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -501,3 +502,34 @@ def get_wifi_status(device_id: str, db: Session = Depends(get_db),
                              updated_at=None)
     return WifiStatusOut(device_id=device_id, ssid=row.ssid,
                          connected=row.connected, updated_at=row.updated_at)
+
+
+# --- Runtime operating mode: switch Local / Hybrid / Cloud-Assisted from the app ---
+
+def _mode_out(db: Session, device_id: str) -> ModeOut:
+    row = db.get(DeviceMode, device_id)
+    if row is None:
+        return ModeOut(device_id=device_id, mode=3, updated_at=None)
+    return ModeOut(device_id=device_id, mode=row.mode, updated_at=row.updated_at)
+
+
+@app.put("/devices/{device_id}/mode", response_model=ModeOut)
+async def set_mode(device_id: str, body: ModeIn,
+                   db: Session = Depends(get_db),
+                   _sub: str = Depends(require_auth)):
+    """Change the lock's operating mode. Device is source of truth; we persist a
+    copy only after the lock acks ok, so the app reflects the device's real mode."""
+    result = await _dispatch_command(device_id, "set_mode", {"mode": body.mode})
+    if result.result == "ok":
+        row = db.get(DeviceMode, device_id) or DeviceMode(device_id=device_id)
+        row.mode = body.mode
+        db.merge(row)
+        db.commit()
+    return _mode_out(db, device_id)
+
+
+@app.get("/devices/{device_id}/mode", response_model=ModeOut)
+def get_mode(device_id: str, db: Session = Depends(get_db),
+             _sub: str = Depends(require_auth)):
+    """Last-acked operating mode; defaults to 3 (firmware default) if never set."""
+    return _mode_out(db, device_id)

@@ -9,7 +9,7 @@ is rejected cleanly instead of corrupting the database.
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, conint
 
 
 class AccessEventIn(BaseModel):
@@ -90,5 +90,19 @@ class UserOut(BaseModel):
     name: str
     image_url: Optional[str]
     created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ModeIn(BaseModel):
+    """Set-mode body. 1=Local, 2=Hybrid, 3=Cloud-Assisted. Out-of-range → 422."""
+    mode: conint(ge=1, le=3)
+
+
+class ModeOut(BaseModel):
+    """The lock's last-acked operating mode as returned by the REST API."""
+    device_id: str
+    mode: int
+    updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
