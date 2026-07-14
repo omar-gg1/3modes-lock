@@ -22,18 +22,18 @@
 #include "temp_pin.h"
 #include "door_pin.h"
 #include "confirm_pin.h"
+#include "mode_ctrl.h"
 #include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
 #define FACE_MATCH_THRESHOLD 0.6f
 
-// ---- Mode 3 (Cloud-Assisted) ----
-// Local recognition runs first; only MURKY-confidence matches ask the cloud
-// ArcFace verifier for a confident second opinion. Confident local cases never
-// touch the network (fast, offline-capable). If the cloud is unreachable during
-// a murky case, we fall back to a local decision (graceful degrade).
-// 0 = pure local recognition (Mode 1/2 behaviour).
-#define MODE3_ENABLED   1
+// ---- Mode 3 (Cloud-Assisted) murky-band thresholds ----
+// In Mode 3, local recognition runs first; only MURKY-confidence matches ask the
+// cloud ArcFace verifier for a confident second opinion. Confident local cases
+// never touch the network. If the cloud is unreachable during a murky case, we
+// fall back to a local decision (graceful degrade). The active mode itself is
+// now runtime (see mode_ctrl) — these are just the score-band tuning constants.
 // Similarity bands on the LOCAL model's score:
 //   sim >= MODE3_HIGH_THR  -> confident local YES (unlock via the normal path)
 //   sim <  MODE3_LOW_THR   -> confident local NO  (deny)
@@ -60,13 +60,11 @@
 #define ENABLE_FACE     1
 #define ENABLE_MODE2    1   // Wi-Fi + MQTT — the thing we are trying to isolate
 
-// ---- Mode 2 (Hybrid) reporting ----
-// 1 = connect Wi-Fi and report each access event to the backend over MQTT.
-// 0 = pure Mode 1 (offline, no network). Reporting is a SIDE EFFECT only: the
-// lock decides + acts locally regardless, and never blocks on the network. If
-// Wi-Fi/broker is unavailable at boot or at runtime, events are silently dropped
-// and the lock keeps working exactly as in Mode 1. See [[mode2-backend]].
-#define MODE2_REPORTING_ENABLED 1
+// Reporting is a SIDE EFFECT only: the lock decides + acts locally regardless,
+// and never blocks on the network. Which modes report is now runtime — gated
+// inside mqtt_ctrl_publish_event (mode>=2). Mode 1 stays silent; 2/3 report.
+// See [[mode2-backend]].
+//
 // How long to wait for Wi-Fi at boot before giving up and running offline.
 // Must exceed the driver's own retry budget (WIFI_MAX_RETRY=5 in wifi_ctrl, each
 // auth/assoc cycle ~2.5s ≈ 12-13s total) — an 8s cap here cut the radio off at
@@ -232,6 +230,8 @@ void app_main(void) {
     door_pin_load();   // seeds from NVS, or the factory default on first boot
     confirm_pin_load(); // liveness-confirmation code + enable toggle (NVS/default)
     wifi_creds_load(); // runtime WiFi creds (NVS), else wifi_config.h defaults
+    mode_ctrl_load();  // runtime operating mode (1/2/3) from NVS, else default 3
+    mode_ctrl_selftest();
 
     // ---- Mode 2 (Hybrid) network bring-up FIRST ----
     // ORDER MATTERS: esp_mqtt_client_init does a MALLOC_CAP_INTERNAL alloc, and
@@ -241,17 +241,22 @@ void app_main(void) {
     // start Wi-Fi + MQTT while internal RAM is still pristine, THEN init the
     // camera/face which spill their big buffers into PSRAM anyway. Reporting is
     // still non-blocking; a missing network just logs and continues (Mode 1).
+    // Bring up Wi-Fi + MQTT in EVERY mode: the app's command channel (incl.
+    // set_mode itself) runs over MQTT, so the radio can't be mode-gated anymore.
+    // Reporting is gated per-mode inside mqtt_ctrl_publish_event (mode>=2); murky
+    // cloud-verify is gated at its call site (mode==3). Non-blocking: a missing
+    // network just logs and the lock runs local-only.
     bool wifi_up = false;
-    if (ENABLE_MODE2 && MODE2_REPORTING_ENABLED) {
+    if (ENABLE_MODE2) {
         char boot_ssid[WIFI_CREDS_SSID_MAX + 1] = {0};
         char boot_pass[WIFI_CREDS_PASS_MAX + 1] = {0};
         wifi_creds_get(boot_ssid, boot_pass);
         if (wifi_ctrl_connect(boot_ssid, boot_pass, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
-            ESP_LOGI(TAG, "Wi-Fi connected — starting MQTT reporting (Mode 2)");
+            ESP_LOGI(TAG, "Wi-Fi connected — MQTT up (command channel + reporting)");
             mqtt_ctrl_init();  // async; reconnects in the background on its own
             wifi_up = true;
         } else {
-            ESP_LOGW(TAG, "Wi-Fi unavailable — running OFFLINE (Mode 1), no reporting");
+            ESP_LOGW(TAG, "Wi-Fi unavailable — running OFFLINE, local-only");
         }
     }
 
@@ -272,7 +277,7 @@ void app_main(void) {
     // stays local-only (local modes never touch the cloud); this sync is the
     // single point where Mode 3 mirrors the on-device faces to ArcFace. Runs
     // after face_ctrl_init() so the encrypted enrollment images are mountable.
-    if (MODE3_ENABLED && wifi_up && ENABLE_FACE) {
+    if (mode_ctrl_get() == 3 && wifi_up && ENABLE_FACE) {
         ESP_LOGI(TAG, "Mode 3: reconciling faces with cloud...");
         mode3_reconcile();
         ESP_LOGI(TAG, "Mode 3: reconcile done");
@@ -446,7 +451,7 @@ void app_main(void) {
                 // Push THIS user's fresh faces to the cloud under their own id
                 // (not user 0), so the cloud gallery stays multi-user. Then bump
                 // the stored revision so the next boot doesn't needlessly re-sync.
-                if (ok && MODE3_ENABLED) {
+                if (ok && mode_ctrl_get() == 3) {
                     int synced = cloud_verify_sync_enrollments(
                         append_user, append_user == 0 ? "primary" : "user");
                     ESP_LOGI(TAG, ">>> cloud sync user=%d: %d face(s)",
@@ -567,7 +572,7 @@ void app_main(void) {
                         // strong second factor, so we skip the confirm PIN (cloud =
                         // identity, liveness = presence — enough). The PIN is only
                         // the second factor in Mode 1/2 where there's no cloud.
-                        if (confirm_pin_enabled() && !MODE3_ENABLED) {
+                        if (confirm_pin_enabled() && mode_ctrl_get() != 3) {
                             // Liveness alone can't reject a hand-held photo on
                             // this detector, so require a secret second factor:
                             // hand off to the confirm-PIN phase (lock stays shut).
@@ -711,7 +716,7 @@ void app_main(void) {
                     bool proceed = false;      // proceed to liveness/unlock for this user
                     bool murky_denied = false; // a cloud-involved DENY -> rest, don't re-hammer
 
-                    if (MODE3_ENABLED) {
+                    if (mode_ctrl_get() == 3) {
                         if (similarity >= MODE3_HIGH_THR) {
                             // Confident local YES — no cloud needed.
                             proceed = true;
