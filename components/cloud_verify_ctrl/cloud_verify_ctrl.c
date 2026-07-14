@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
@@ -416,6 +418,7 @@ int cloud_verify_pull_new_faces(const int *known_users, int known_count)
         int s = (uid < 64) ? sample_of[uid]++ : 0;
         if (face_ctrl_import_face(uid, s, jpg, jlen) == ESP_OK) imported++;
         heap_caps_free(jpg);
+        vTaskDelay(pdMS_TO_TICKS(20));   // HTTP + esp-dl enroll per iter — yield
     }
     heap_caps_free(body);
     ESP_LOGI(TAG, "pull faces: imported %d new cloud face(s)", imported);

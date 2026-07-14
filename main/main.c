@@ -263,6 +263,8 @@ void app_main(void) {
         ESP_LOGI(TAG, "Mode 3: reconciling faces with cloud...");
         mode3_reconcile();
         ESP_LOGI(TAG, "Mode 3: reconcile done");
+        vTaskDelay(pdMS_TO_TICKS(200));   // let flash/HTTP/heap settle before the
+                                          // main face loop starts driving esp-dl
     }
 
     ESP_LOGI(TAG, "System ready.");

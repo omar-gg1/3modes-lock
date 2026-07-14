@@ -301,6 +301,9 @@ static void enroll_img_enc_path(int user_id, int sample, char *out, size_t out_s
 }
 
 // How many enrollment images exist on flash for one user (contiguous run from 0).
+// A missing path forces a full SPIFFS object-table scan; callers loop this over
+// up to MAX_ENROLL_USERS ids, so a run of misses back-to-back starves the idle
+// task -> task_wdt. Yield once per user so IDLE/watchdog always gets serviced.
 static int enroll_imgs_count_user(int user_id)
 {
     int n = 0;
@@ -312,6 +315,7 @@ static int enroll_imgs_count_user(int user_id)
         fclose(f);
         n++;
     }
+    vTaskDelay(1);   // let IDLE/watchdog run between per-user flash scans
     return n;
 }
 
