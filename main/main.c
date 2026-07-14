@@ -366,8 +366,10 @@ void app_main(void) {
                         mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, true);
                     } else if (temp_pin_try(pin_buf)) {
                         // OTP-style guest PIN — consumed on this single use.
+                        // Emit the temp_pin method so the app clears its armed
+                        // slot and the log distinguishes it from a normal PIN.
                         lock_ctrl_trigger_unlock("temp PIN");
-                        mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, true);
+                        mqtt_ctrl_publish_event(MQTT_METHOD_TEMP_PIN, -1, NAN, true);
                     } else {
                         ESP_LOGW(TAG, "Wrong unlock PIN");
                         mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, false);

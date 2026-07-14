@@ -316,10 +316,11 @@ esp_err_t mqtt_ctrl_init(void)
 static const char *method_str(mqtt_method_t m)
 {
     switch (m) {
-    case MQTT_METHOD_FACE:   return "face";
-    case MQTT_METHOD_PIN:    return "pin";
-    case MQTT_METHOD_BUTTON: return "button";
-    default:                 return "unknown";
+    case MQTT_METHOD_FACE:     return "face";
+    case MQTT_METHOD_PIN:      return "pin";
+    case MQTT_METHOD_BUTTON:   return "button";
+    case MQTT_METHOD_TEMP_PIN: return "temp_pin";
+    default:                   return "unknown";
     }
 }
 

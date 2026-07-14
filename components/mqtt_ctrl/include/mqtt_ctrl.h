@@ -30,6 +30,8 @@ typedef enum {
     MQTT_METHOD_FACE = 0,
     MQTT_METHOD_PIN,
     MQTT_METHOD_BUTTON,
+    MQTT_METHOD_TEMP_PIN,   // OTP guest PIN consumed — distinct so the app can
+                            // clear its armed slot and the log reads "Temp PIN"
 } mqtt_method_t;
 
 /**
