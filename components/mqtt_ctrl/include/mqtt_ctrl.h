@@ -62,6 +62,16 @@ void mqtt_ctrl_publish_event(mqtt_method_t method, int id, float score, bool gra
  */
 bool mqtt_ctrl_is_connected(void);
 
+/**
+ * @brief Publish the current WiFi association state so the app can show which
+ *        network the lock is on (green/connected vs offline). Fire-and-forget,
+ *        same no-op-when-disconnected semantics as publish_event.
+ *   {"event":"wifi","ssid":"<name>","connected":<bool>,"ts":<epoch_s>}
+ * @param ssid       associated SSID, or "" when not connected
+ * @param connected  true => associated with an AP / has IP
+ */
+void mqtt_ctrl_publish_wifi(const char *ssid, bool connected);
+
 #ifdef __cplusplus
 }
 #endif

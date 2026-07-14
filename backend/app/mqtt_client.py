@@ -14,7 +14,7 @@ import os
 
 import paho.mqtt.client as mqtt
 
-from .database import SessionLocal, AccessEvent
+from .database import SessionLocal, AccessEvent, WifiStatus
 from .schemas import AccessEventIn
 from . import reachability, commands
 
@@ -76,6 +76,27 @@ def _on_message(client, userdata, msg):
         commands.handle_ack(payload)
         from . import ws
         ws.broadcast_threadsafe({"kind": "ack", "device_id": device_id, **payload})
+        return
+
+    # wifi status branch — a different shape on the same events topic. Upsert the
+    # latest SSID/connected so the app can show which network the lock is on.
+    if payload.get("event") == "wifi":
+        session = SessionLocal()
+        try:
+            row = session.get(WifiStatus, device_id) or WifiStatus(device_id=device_id)
+            row.ssid = str(payload.get("ssid", ""))
+            row.connected = bool(payload.get("connected", False))
+            session.merge(row)
+            session.commit()
+            log.info("wifi status: %s ssid=%s connected=%s",
+                     device_id, row.ssid, row.connected)
+            from . import ws
+            ws.broadcast_threadsafe({"kind": "wifi", "device_id": device_id, **payload})
+        except Exception as e:
+            session.rollback()
+            log.error("failed to store wifi status: %s", e)
+        finally:
+            session.close()
         return
 
     # events branch — original behavior (validate + store)

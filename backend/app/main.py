@@ -28,7 +28,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import mqtt_client, security, reachability, commands
-from .database import SessionLocal, AccessEvent, User, DoorCode, ConfirmCode, init_db, wait_for_db
+from .database import SessionLocal, AccessEvent, User, DoorCode, ConfirmCode, WifiStatus, init_db, wait_for_db
 from .schemas import (AccessEventOut, LoginIn, TokenOut, DeviceStatusOut,
                       CommandOut, UserIn, UserUpdate, UserOut)
 
@@ -471,3 +471,33 @@ def reveal_confirm_pin(device_id: str, db: Session = Depends(get_db),
         pin=security.decrypt_pin(row.pin_enc) if row.pin_enc else None,
         enabled=row.enabled,
         updated_at=row.updated_at)
+
+
+# --- WiFi QR provisioning: arm the camera scan + read the reported network ---
+
+class WifiStatusOut(BaseModel):
+    device_id: str
+    ssid: Optional[str]          # None if the lock has never reported its network
+    connected: bool
+    updated_at: Optional[datetime]
+
+
+@app.post("/devices/{device_id}/wifi_scan", response_model=CommandOut)
+async def start_wifi_scan(device_id: str, _sub: str = Depends(require_auth)):
+    """Tell the lock to arm its camera and scan a WiFi QR shown by the app.
+    The credentials never pass through the backend — the lock reads them straight
+    off the phone screen. We only relay the 'start scanning' command."""
+    return await _dispatch_command(device_id, "start_wifi_scan", {})
+
+
+@app.get("/devices/{device_id}/wifi", response_model=WifiStatusOut)
+def get_wifi_status(device_id: str, db: Session = Depends(get_db),
+                    _sub: str = Depends(require_auth)):
+    """Latest WiFi network the lock reported. connected=False / ssid=None until
+    the lock first publishes a wifi status event."""
+    row = db.get(WifiStatus, device_id)
+    if row is None:
+        return WifiStatusOut(device_id=device_id, ssid=None, connected=False,
+                             updated_at=None)
+    return WifiStatusOut(device_id=device_id, ssid=row.ssid,
+                         connected=row.connected, updated_at=row.updated_at)

@@ -32,3 +32,23 @@ bool enroll_request_take(int *user_id, int *samples)
     portEXIT_CRITICAL(&s_mux);
     return had;
 }
+
+// Separate single-slot latch for the WiFi QR scan trigger. Shares the same
+// spinlock — both are set from the MQTT task, taken from the main loop.
+static volatile bool s_wifi_scan_pending = false;
+
+void wifi_scan_request_set(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    s_wifi_scan_pending = true;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+bool wifi_scan_request_take(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    bool had = s_wifi_scan_pending;
+    s_wifi_scan_pending = false;
+    portEXIT_CRITICAL(&s_mux);
+    return had;
+}

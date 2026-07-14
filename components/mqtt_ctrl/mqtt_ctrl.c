@@ -268,6 +268,10 @@ static void handle_command(const char *json, int len)
         bool on = cJSON_IsBool(jon) ? cJSON_IsTrue(jon) : true;
         confirm_pin_set_enabled(on);
         publish_ack(nonce, "ok", "updated");
+    } else if (strcmp(type, "start_wifi_scan") == 0) {
+        // Arm the camera to scan a WiFi QR from the app. Main loop takes it.
+        wifi_scan_request_set();
+        publish_ack(nonce, "ok", "scanning");
     } else {
         publish_ack(nonce, "error", "unknown_type");
     }
@@ -377,6 +381,41 @@ void mqtt_ctrl_publish_event(mqtt_method_t method, int id, float score, bool gra
         ESP_LOGW(TAG, "failed to enqueue event (dropped)");
     } else {
         ESP_LOGI(TAG, "event queued: %s", payload);
+    }
+}
+
+void mqtt_ctrl_publish_wifi(const char *ssid, bool connected)
+{
+    if (s_client == NULL || !s_connected) {
+        return;
+    }
+    if (ssid == NULL) ssid = "";
+
+    // Escape nothing fancy — SSIDs can contain quotes/backslashes; emit them
+    // JSON-safe with a minimal escaper into a bounded buffer.
+    char esc[2 * 32 + 1];
+    size_t j = 0;
+    for (size_t i = 0; ssid[i] && j + 2 < sizeof(esc); i++) {
+        char c = ssid[i];
+        if (c == '"' || c == '\\') esc[j++] = '\\';
+        esc[j++] = c;
+    }
+    esc[j] = '\0';
+
+    char payload[128];
+    int n = snprintf(payload, sizeof(payload),
+        "{\"event\":\"wifi\",\"ssid\":\"%s\",\"connected\":%s,\"ts\":%lld}",
+        esc, connected ? "true" : "false", event_timestamp());
+    if (n <= 0 || n >= (int) sizeof(payload)) {
+        ESP_LOGW(TAG, "wifi payload truncated, skipping");
+        return;
+    }
+
+    int msg_id = esp_mqtt_client_enqueue(s_client, s_topic, payload, n, 0, 0, true);
+    if (msg_id < 0) {
+        ESP_LOGW(TAG, "failed to enqueue wifi status (dropped)");
+    } else {
+        ESP_LOGI(TAG, "wifi status queued: %s", payload);
     }
 }
 

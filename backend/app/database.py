@@ -112,6 +112,20 @@ class ConfirmCode(Base):
                         onupdate=lambda: datetime.now(timezone.utc))
 
 
+class WifiStatus(Base):
+    """Latest WiFi association the lock reported (which network it's on). One row
+    per device, upserted from the `wifi` status event. No password is ever stored
+    — only the SSID and whether it's connected — so the app can show green/offline.
+    """
+    __tablename__ = "wifi_status"
+
+    device_id = Column(String(64), primary_key=True)
+    ssid = Column(String(64))
+    connected = Column(Boolean, default=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+
 class User(Base):
     """A named person the lock recognizes, keyed to the firmware's user_id.
 

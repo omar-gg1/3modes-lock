@@ -1,5 +1,6 @@
 #include "wifi_ctrl.h"
 #include <string.h>
+#include <stddef.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
@@ -90,7 +91,10 @@ esp_err_t wifi_ctrl_connect(const char *ssid, const char *password, uint32_t tim
     wifi_config_t wifi_config = { 0 };
     strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    // Empty password => open network; don't force a WPA2 threshold or the driver
+    // rejects the association. Runtime-provisioned networks may be open.
+    wifi_config.sta.threshold.authmode =
+        password[0] == '\0' ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -116,4 +120,57 @@ esp_err_t wifi_ctrl_connect(const char *ssid, const char *password, uint32_t tim
     ESP_LOGW(TAG, "Wi-Fi connection failed or timed out — stopping radio, running fully offline");
     esp_wifi_stop();
     return ESP_FAIL;
+}
+
+esp_err_t wifi_ctrl_reconnect(const char *ssid, const char *password, uint32_t timeout_ms) {
+    // First-ever provision with Mode 2 off at boot: the stack was never inited,
+    // so fall back to the full connect path (which inits + starts it).
+    if (!s_wifi_stack_initialized) {
+        return wifi_ctrl_connect(ssid, password, timeout_ms);
+    }
+
+    // Stack is up: reconfigure and reconnect in place — no netif/driver re-init.
+    // esp_wifi_start() may have been stopped after a prior failed connect, so
+    // start it again (a no-op / benign if already started).
+    esp_wifi_start();
+    esp_wifi_disconnect();
+
+    wifi_config_t wifi_config = { 0 };
+    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode =
+        password[0] == '\0' ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+
+    // Clear stale result bits and the retry counter so this attempt starts fresh.
+    s_retry_num = 0;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "reconnect set_config failed: %s", esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Wi-Fi reconnecting to '%s'...", ssid);
+    esp_wifi_connect();
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(timeout_ms));
+
+    return (bits & WIFI_CONNECTED_BIT) ? ESP_OK : ESP_FAIL;
+}
+
+bool wifi_ctrl_status(char *ssid_out, size_t ssid_cap) {
+    wifi_ap_record_t ap;
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    bool connected = (err == ESP_OK);
+    if (ssid_out && ssid_cap) {
+        if (connected) {
+            strncpy(ssid_out, (const char *)ap.ssid, ssid_cap - 1);
+            ssid_out[ssid_cap - 1] = '\0';
+        } else {
+            ssid_out[0] = '\0';
+        }
+    }
+    return connected;
 }

@@ -12,6 +12,8 @@
 #include "camera_ctrl.h"
 #include "keypad_ctrl.h"
 #include "wifi_ctrl.h"
+#include "wifi_creds.h"
+#include "qr_scan.h"
 #include "crypto_ctrl.h"
 #include "liveness_ctrl.h"
 #include "mqtt_ctrl.h"
@@ -73,6 +75,11 @@
 // Mode 3 needs the network for cloud sync + verify, so give the retries room to
 // finish. A truly-absent AP still fails fast (NO_AP_FOUND ends the retries early).
 #define WIFI_CONNECT_TIMEOUT_MS 20000
+
+// How long the camera hunts for a WiFi QR after provisioning is armed, and how
+// long to wait for the new network to associate once a QR is decoded.
+#define PROVISION_SCAN_WINDOW_MS 30000
+#define PROVISION_CONNECT_TIMEOUT_MS 15000
 
 // Master switch for the liveness challenge. 1 = require a brief frontal-motion
 // challenge after a face match before unlocking (anti-photo-spoof). 0 = face
@@ -224,6 +231,7 @@ void app_main(void) {
     nvs_init_safe();
     door_pin_load();   // seeds from NVS, or the factory default on first boot
     confirm_pin_load(); // liveness-confirmation code + enable toggle (NVS/default)
+    wifi_creds_load(); // runtime WiFi creds (NVS), else wifi_config.h defaults
 
     // ---- Mode 2 (Hybrid) network bring-up FIRST ----
     // ORDER MATTERS: esp_mqtt_client_init does a MALLOC_CAP_INTERNAL alloc, and
@@ -235,7 +243,10 @@ void app_main(void) {
     // still non-blocking; a missing network just logs and continues (Mode 1).
     bool wifi_up = false;
     if (ENABLE_MODE2 && MODE2_REPORTING_ENABLED) {
-        if (wifi_ctrl_connect(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
+        char boot_ssid[WIFI_CREDS_SSID_MAX + 1] = {0};
+        char boot_pass[WIFI_CREDS_PASS_MAX + 1] = {0};
+        wifi_creds_get(boot_ssid, boot_pass);
+        if (wifi_ctrl_connect(boot_ssid, boot_pass, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
             ESP_LOGI(TAG, "Wi-Fi connected — starting MQTT reporting (Mode 2)");
             mqtt_ctrl_init();  // async; reconnects in the background on its own
             wifi_up = true;
@@ -284,6 +295,11 @@ void app_main(void) {
     bool append_armed = false;
     int64_t append_armed_at_us = 0;
     int append_user = 0, append_samples = 0;
+
+    // WiFi QR provisioning: armed by the app (start_wifi_scan) or the *8# keypad
+    // combo. While armed, each frame is checked for a WiFi QR instead of a face.
+    bool provision_armed = false;
+    int64_t provision_armed_at_us = 0;
 
     // PIN entry buffer. Built up as keys are pressed.
     // '*' at start arms enrollment; '*' mid-entry clears.
@@ -356,6 +372,13 @@ void app_main(void) {
                         enrollment_armed_at_us = esp_timer_get_time();
                         ESP_LOGI(TAG, ">>> ENROLLMENT ARMED via PIN — show face within %ds",
                                  ENROLLMENT_TIMEOUT_MS / 1000);
+                    } else if (strcmp(pin_buf, "8") == 0) {
+                        // *8# — arm WiFi QR provisioning locally. Works with no
+                        // network so the first-ever network can be set on-site.
+                        provision_armed = true;
+                        provision_armed_at_us = esp_timer_get_time();
+                        ESP_LOGI(TAG, ">>> WiFi QR scan ARMED via *8# — show the app QR "
+                                 "within %ds", PROVISION_SCAN_WINDOW_MS / 1000);
                     } else {
                         ESP_LOGW(TAG, "Wrong enrollment PIN");
                     }
@@ -445,6 +468,55 @@ void app_main(void) {
             }
             // still armed and inside the window: fall through, poll again
             if (append_armed) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        }
+
+        // ---- WiFi QR provisioning takes priority over the face pipeline ----
+        // Armed by the app (start_wifi_scan) or *8#. While armed, each frame is
+        // scanned for a WiFi QR; on decode we persist the creds and reconnect.
+        if (wifi_scan_request_take()) {
+            provision_armed = true;
+            provision_armed_at_us = esp_timer_get_time();
+            ESP_LOGI(TAG, ">>> WiFi QR scan ARMED (remote) — show the app QR within %ds",
+                     PROVISION_SCAN_WINDOW_MS / 1000);
+        }
+        if (provision_armed) {
+            int64_t elapsed_ms = (esp_timer_get_time() - provision_armed_at_us) / 1000;
+            char qssid[WIFI_CREDS_SSID_MAX + 1] = {0};
+            char qpass[WIFI_CREDS_PASS_MAX + 1] = {0};
+            bool got = false;
+            camera_fb_t *fb = camera_ctrl_get_frame();
+            if (fb) {
+                got = qr_scan_wifi(fb, qssid, qpass);
+                camera_ctrl_return_frame(fb);
+            }
+            if (got) {
+                ESP_LOGI(TAG, ">>> WiFi QR: SSID='%s' — saving + reconnecting", qssid);
+                bool saved = wifi_creds_set(qssid, qpass);
+                bool connected = false;
+                if (saved) {
+                    wifi_ctrl_reconnect(qssid, qpass, PROVISION_CONNECT_TIMEOUT_MS);
+                    // Authoritative live check (reconnect's own retry loop may
+                    // land the IP just after its wait returns).
+                    char live[WIFI_CREDS_SSID_MAX + 1] = {0};
+                    connected = wifi_ctrl_status(live, sizeof(live));
+                    // If we reconnected onto a network with a working broker,
+                    // report it; if MQTT was down this is a no-op (app polls).
+                    mqtt_ctrl_publish_wifi(connected ? live : qssid, connected);
+                    ESP_LOGI(TAG, ">>> WiFi provision %s (ssid='%s')",
+                             connected ? "CONNECTED" : "saved but not connected", qssid);
+                } else {
+                    ESP_LOGW(TAG, ">>> WiFi QR rejected (bad ssid/pass length)");
+                }
+                provision_armed = false;
+                face_state = FACE_SCANNING;
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            } else if (elapsed_ms > PROVISION_SCAN_WINDOW_MS) {
+                ESP_LOGW(TAG, "WiFi QR scan: no code within window");
+                provision_armed = false;
+                face_state = FACE_SCANNING;
+            }
+            if (provision_armed) { vTaskDelay(pdMS_TO_TICKS(120)); continue; }
         }
 
         // ---- Enrollment takes priority over the normal pipeline ----

@@ -1,0 +1,2 @@
+dependencies:
+  espressif/quirc: "^1.2.0"
