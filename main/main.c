@@ -18,6 +18,7 @@
 #include "cloud_verify_ctrl.h"
 #include "enroll_request.h"
 #include "temp_pin.h"
+#include "door_pin.h"
 #include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
@@ -223,6 +224,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "==== Smart Lock booting ====");
 
     nvs_init_safe();
+    door_pin_load();   // seeds from NVS, or the factory default on first boot
 
     // ---- Mode 2 (Hybrid) network bring-up FIRST ----
     // ORDER MATTERS: esp_mqtt_client_init does a MALLOC_CAP_INTERNAL alloc, and
@@ -359,7 +361,7 @@ void app_main(void) {
                         ESP_LOGW(TAG, "Wrong enrollment PIN");
                     }
                 } else {
-                    if (strcmp(pin_buf, UNLOCK_PIN) == 0) {
+                    if (door_pin_matches(pin_buf)) {
                         lock_ctrl_trigger_unlock("PIN code");
                         mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, true);
                     } else if (temp_pin_try(pin_buf)) {

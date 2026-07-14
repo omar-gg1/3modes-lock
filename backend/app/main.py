@@ -345,3 +345,25 @@ async def clear_temp_pin(device_id: str, _sub: str = Depends(require_auth)):
     """Revoke any active guest PIN on the lock (empty pin clears the slot)."""
     return await _dispatch_command(device_id, "set_temp_pin",
                                    {"pin": "", "ttl_s": 0})
+
+
+# --- Door code (persistent household PIN; lives on the device, not the DB) ---
+
+class DoorPinIn(BaseModel):
+    pin: str
+
+    @field_validator("pin")
+    @classmethod
+    def _pin_digits(cls, v: str) -> str:
+        if not re.fullmatch(r"\d{4,8}", v):
+            raise ValueError("pin must be 4-8 digits")
+        return v
+
+
+@app.post("/devices/{device_id}/door_pin", response_model=CommandOut)
+async def set_door_pin(device_id: str, body: DoorPinIn,
+                       _sub: str = Depends(require_auth)):
+    """Change the lock's persistent unlock PIN. It survives reboots and never
+    expires. Not stored server-side — the device is the source of truth, and the
+    PIN never leaves the device once set (there is no GET to read it back)."""
+    return await _dispatch_command(device_id, "set_door_pin", {"pin": body.pin})
