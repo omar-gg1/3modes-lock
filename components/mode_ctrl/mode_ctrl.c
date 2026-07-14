@@ -58,12 +58,15 @@ bool mode_ctrl_set(uint8_t m)
 
 bool mode_ctrl_selftest(void)
 {
-    uint8_t saved = mode_ctrl_get();
-    bool pass = mode_ctrl_set(1) && mode_ctrl_get() == 1
-             && mode_ctrl_set(2) && mode_ctrl_get() == 2
-             && mode_ctrl_set(3) && mode_ctrl_get() == 3
-             && !mode_ctrl_set(4) && mode_ctrl_get() == 3;   // reject leaves it at 3
-    mode_ctrl_set(saved);                                    // restore
-    ESP_LOGI(TAG, "mode_ctrl self-test: %s", pass ? "PASS" : "FAIL");
+    // Verify the range contract WITHOUT touching NVS. The original version called
+    // mode_ctrl_set() (an NVS commit) five times here at boot; a flash write
+    // disables the flash cache on the other core, and the ESP_LOGI below then read
+    // a flash string with cache off -> "Cache disabled but cached memory region
+    // accessed" panic + boot loop. Testing valid_mode() alone checks the real
+    // 1..3 rule (the only thing that can regress) and never writes flash.
+    bool pass = valid_mode(1) && valid_mode(2) && valid_mode(3)
+             && !valid_mode(0) && !valid_mode(4);
+    ESP_LOGI(TAG, "mode_ctrl self-test: %s (mode=%d)",
+             pass ? "PASS" : "FAIL", mode_ctrl_get());
     return pass;
 }
