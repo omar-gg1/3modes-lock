@@ -46,3 +46,33 @@ def make_token(sub: str) -> str:
 
 def verify_token(token: str) -> dict:
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+
+
+# --- Door-code encryption (reveal-able, but useless in the DB alone) ---
+# The door code is stored encrypted, not plaintext: a DB leak must not hand
+# over every door PIN. Fernet (AES-128-CBC + HMAC) is reversible so an authed
+# admin can reveal the real digits — the protection is that the key lives in an
+# env var, never in the DB. Rotating DOOR_PIN_KEY invalidates stored ciphertext.
+import base64 as _b64
+
+from cryptography.fernet import Fernet
+
+# Derive a valid 32-byte urlsafe-base64 Fernet key from a plain env secret so
+# ops set a normal string, not a pre-encoded key. ponytail: SHA-256 KDF, swap
+# for a real KDF (scrypt) only if the secret is low-entropy.
+_DOOR_KEY_SECRET = os.environ.get("DOOR_PIN_KEY", "dev-door-pin-key")
+_fernet = Fernet(_b64.urlsafe_b64encode(hashlib.sha256(_DOOR_KEY_SECRET.encode()).digest()))
+
+
+# Generic pin crypto — the door code and the liveness-confirmation code share the
+# same key. encrypt_door_pin/decrypt_door_pin stay as aliases for existing callers.
+def encrypt_pin(pin: str) -> str:
+    return _fernet.encrypt(pin.encode()).decode()
+
+
+def decrypt_pin(token: str) -> str:
+    return _fernet.decrypt(token.encode()).decode()
+
+
+encrypt_door_pin = encrypt_pin
+decrypt_door_pin = decrypt_pin

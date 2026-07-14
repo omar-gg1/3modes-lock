@@ -17,6 +17,7 @@
 #include "enroll_request.h"
 #include "temp_pin.h"
 #include "door_pin.h"
+#include "confirm_pin.h"
 #include "face_ctrl.h"
 #include "cloud_verify_ctrl.h"
 
@@ -251,6 +252,22 @@ static void handle_command(const char *json, int len)
         } else {
             publish_ack(nonce, "error", "bad_pin");
         }
+    } else if (strcmp(type, "set_confirm_pin") == 0) {
+        // Liveness-confirmation code — the 2nd factor typed after liveness.
+        // Persistent, no expiry, 4-8 digits. See [[confirm-pin-second-factor]].
+        const cJSON *jpin = cJSON_GetObjectItem(jargs, "pin");
+        const char *pin = cJSON_IsString(jpin) ? jpin->valuestring : "";
+        if (confirm_pin_set(pin)) {
+            publish_ack(nonce, "ok", "updated");
+        } else {
+            publish_ack(nonce, "error", "bad_pin");
+        }
+    } else if (strcmp(type, "set_confirm_enabled") == 0) {
+        // Turn the liveness-confirmation requirement on/off from the app.
+        const cJSON *jon = cJSON_GetObjectItem(jargs, "enabled");
+        bool on = cJSON_IsBool(jon) ? cJSON_IsTrue(jon) : true;
+        confirm_pin_set_enabled(on);
+        publish_ack(nonce, "ok", "updated");
     } else {
         publish_ack(nonce, "error", "unknown_type");
     }

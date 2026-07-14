@@ -19,6 +19,7 @@
 #include "enroll_request.h"
 #include "temp_pin.h"
 #include "door_pin.h"
+#include "confirm_pin.h"
 #include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
@@ -112,13 +113,10 @@
 // we demand a short secret PIN as a second factor. A photo can pass the camera
 // but cannot type the PIN, so a photo alone never opens the lock.
 //
-// 1 = require the confirm PIN after liveness; 0 = liveness PASS unlocks directly
-// (old behaviour / snappy demo). Toggleable just like LIVENESS_ENABLED.
-#define CONFIRM_PIN_ENABLED 1
-
-// The confirm PIN itself — SEPARATE from UNLOCK_PIN (1234) and ENROLL_PIN (9999).
-// Committed with '#', same as the others.
-#define CONFIRM_PIN     "0000"
+// The confirm-PIN requirement (whether it's on) and the code itself are now
+// runtime + NVS-persisted + app-managed — see confirm_pin.c. Gate reads
+// confirm_pin_enabled(); the code is checked via confirm_pin_matches(). Factory
+// defaults ("0000", enabled) live in confirm_pin.c for first boot only.
 
 // How long the user has to type the confirm PIN after passing liveness. Short by
 // design (a second factor should be quick); adjustable.
@@ -145,7 +143,7 @@ typedef enum {
 // PIN codes. Both end with '#' to commit.
 // '*' at start of entry = arm enrollment mode.
 // '*' mid-entry = clear and restart.
-#define UNLOCK_PIN     "1234"
+// Door code (main unlock PIN) is app-managed and lives in NVS — see door_pin.c.
 #define ENROLL_PIN     "9999"
 #define MAX_PIN_LEN    8
 
@@ -225,6 +223,7 @@ void app_main(void) {
 
     nvs_init_safe();
     door_pin_load();   // seeds from NVS, or the factory default on first boot
+    confirm_pin_load(); // liveness-confirmation code + enable toggle (NVS/default)
 
     // ---- Mode 2 (Hybrid) network bring-up FIRST ----
     // ORDER MATTERS: esp_mqtt_client_init does a MALLOC_CAP_INTERNAL alloc, and
@@ -273,11 +272,11 @@ void app_main(void) {
     ESP_LOGI(TAG, "System ready.");
     ESP_LOGI(TAG, "  - Show enrolled face: unlock");
     ESP_LOGI(TAG, "  - Tap BOOT: manual unlock");
-    ESP_LOGI(TAG, "  - PIN %s# : unlock", UNLOCK_PIN);
+    ESP_LOGI(TAG, "  - Door code # : unlock (app-managed, stored in NVS)");
     ESP_LOGI(TAG, "  - PIN *%s# : arm enrollment", ENROLL_PIN);
-    if (CONFIRM_PIN_ENABLED) {
-        ESP_LOGI(TAG, "  - After face+liveness: enter confirm PIN %s# (2nd factor)",
-                 CONFIRM_PIN);
+    if (confirm_pin_enabled()) {
+        ESP_LOGI(TAG, "  - After face+liveness: enter liveness confirmation code # "
+                      "(app-managed, stored in NVS)");
     }
 
     bool enrollment_armed = false;
@@ -496,7 +495,7 @@ void app_main(void) {
                         // strong second factor, so we skip the confirm PIN (cloud =
                         // identity, liveness = presence — enough). The PIN is only
                         // the second factor in Mode 1/2 where there's no cloud.
-                        if (CONFIRM_PIN_ENABLED && !MODE3_ENABLED) {
+                        if (confirm_pin_enabled() && !MODE3_ENABLED) {
                             // Liveness alone can't reject a hand-held photo on
                             // this detector, so require a secret second factor:
                             // hand off to the confirm-PIN phase (lock stays shut).
@@ -562,7 +561,7 @@ void app_main(void) {
                     ESP_LOGI(TAG, "Confirm PIN cleared");
                 } else if (key == '#') {
                     confirm_buf[confirm_len] = 0;
-                    if (strcmp(confirm_buf, CONFIRM_PIN) == 0) {
+                    if (confirm_pin_matches(confirm_buf)) {
                         // Second factor satisfied — unlock for real.
                         confirm_strikes = 0;  // reset on success
                         lock_ctrl_trigger_unlock("face + liveness + confirm PIN");

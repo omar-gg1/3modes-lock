@@ -16,6 +16,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 from fastapi import (FastAPI, Depends, HTTPException, Query, WebSocket,
@@ -27,7 +28,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import mqtt_client, security, reachability, commands
-from .database import SessionLocal, AccessEvent, User, init_db, wait_for_db
+from .database import SessionLocal, AccessEvent, User, DoorCode, ConfirmCode, init_db, wait_for_db
 from .schemas import (AccessEventOut, LoginIn, TokenOut, DeviceStatusOut,
                       CommandOut, UserIn, UserUpdate, UserOut)
 
@@ -360,10 +361,113 @@ class DoorPinIn(BaseModel):
         return v
 
 
+class DoorPinReveal(BaseModel):
+    device_id: str
+    pin: Optional[str]           # None if no code has ever been set via the app
+    updated_at: Optional[datetime]
+
+
 @app.post("/devices/{device_id}/door_pin", response_model=CommandOut)
 async def set_door_pin(device_id: str, body: DoorPinIn,
+                       db: Session = Depends(get_db),
                        _sub: str = Depends(require_auth)):
-    """Change the lock's persistent unlock PIN. It survives reboots and never
-    expires. Not stored server-side — the device is the source of truth, and the
-    PIN never leaves the device once set (there is no GET to read it back)."""
-    return await _dispatch_command(device_id, "set_door_pin", {"pin": body.pin})
+    """Change the lock's persistent unlock PIN. The device is the source of
+    truth; we ALSO stash an encrypted copy here (only after the lock acks ok) so
+    an authed admin can review it in the app. The copy is Fernet-encrypted, so
+    the DB alone never exposes it."""
+    result = await _dispatch_command(device_id, "set_door_pin", {"pin": body.pin})
+    if result.result == "ok":
+        row = db.get(DoorCode, device_id) or DoorCode(device_id=device_id)
+        row.pin_enc = security.encrypt_door_pin(body.pin)
+        db.merge(row)
+        db.commit()
+    return result
+
+
+@app.get("/devices/{device_id}/door_pin", response_model=DoorPinReveal)
+def reveal_door_pin(device_id: str, db: Session = Depends(get_db),
+                    _sub: str = Depends(require_auth)):
+    """Reveal the last app-set door code for an authed admin. Decrypts the
+    stored copy. Returns pin=None if the code was never set through the app
+    (e.g. set directly on the keypad, which the server never sees)."""
+    row = db.get(DoorCode, device_id)
+    if row is None:
+        return DoorPinReveal(device_id=device_id, pin=None, updated_at=None)
+    return DoorPinReveal(device_id=device_id,
+                         pin=security.decrypt_door_pin(row.pin_enc),
+                         updated_at=row.updated_at)
+
+
+# --- Liveness-confirmation code (2nd factor typed after liveness) + toggle ---
+
+class ConfirmPinIn(BaseModel):
+    pin: str
+
+    @field_validator("pin")
+    @classmethod
+    def _pin_digits(cls, v: str) -> str:
+        if not re.fullmatch(r"\d{4,8}", v):
+            raise ValueError("pin must be 4-8 digits")
+        return v
+
+
+class ConfirmEnabledIn(BaseModel):
+    enabled: bool
+
+
+class ConfirmReveal(BaseModel):
+    device_id: str
+    pin: Optional[str]           # None if no code has ever been set via the app
+    enabled: bool
+    updated_at: Optional[datetime]
+
+
+def _get_confirm_row(db: Session, device_id: str) -> ConfirmCode:
+    return db.get(ConfirmCode, device_id) or ConfirmCode(device_id=device_id)
+
+
+@app.post("/devices/{device_id}/confirm_pin", response_model=CommandOut)
+async def set_confirm_pin(device_id: str, body: ConfirmPinIn,
+                          db: Session = Depends(get_db),
+                          _sub: str = Depends(require_auth)):
+    """Change the liveness-confirmation code. Device is source of truth; we stash
+    an encrypted copy (only after the lock acks ok) so an admin can reveal it."""
+    result = await _dispatch_command(device_id, "set_confirm_pin", {"pin": body.pin})
+    if result.result == "ok":
+        row = _get_confirm_row(db, device_id)
+        row.pin_enc = security.encrypt_pin(body.pin)
+        db.merge(row)
+        db.commit()
+    return result
+
+
+@app.post("/devices/{device_id}/confirm_enabled", response_model=CommandOut)
+async def set_confirm_enabled(device_id: str, body: ConfirmEnabledIn,
+                              db: Session = Depends(get_db),
+                              _sub: str = Depends(require_auth)):
+    """Turn the liveness-confirmation requirement on/off. Persist the flag only
+    after the lock acks ok, so the app reflects the device's real state."""
+    result = await _dispatch_command(device_id, "set_confirm_enabled",
+                                     {"enabled": body.enabled})
+    if result.result == "ok":
+        row = _get_confirm_row(db, device_id)
+        row.enabled = body.enabled
+        db.merge(row)
+        db.commit()
+    return result
+
+
+@app.get("/devices/{device_id}/confirm_pin", response_model=ConfirmReveal)
+def reveal_confirm_pin(device_id: str, db: Session = Depends(get_db),
+                       _sub: str = Depends(require_auth)):
+    """Reveal the last app-set confirmation code + enable flag for an admin.
+    pin=None if never set through the app; enabled defaults True (firmware default)."""
+    row = db.get(ConfirmCode, device_id)
+    if row is None:
+        return ConfirmReveal(device_id=device_id, pin=None, enabled=True,
+                             updated_at=None)
+    return ConfirmReveal(
+        device_id=device_id,
+        pin=security.decrypt_pin(row.pin_enc) if row.pin_enc else None,
+        enabled=row.enabled,
+        updated_at=row.updated_at)

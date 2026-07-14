@@ -9,7 +9,7 @@ import os
 import time
 from datetime import datetime, timezone
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -78,6 +78,38 @@ class AccessEvent(Base):
     # was offline and the event was buffered/replayed later.
     device_ts = Column(Integer, nullable=True)
     received_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class DoorCode(Base):
+    """The last door PIN set for a device, so an admin can review it in the app.
+
+    One row per device (device_id is the primary key — set overwrites). The PIN
+    is stored ENCRYPTED (security.encrypt_door_pin), never plaintext: the device
+    is still the source of truth for unlocking, this is only a convenience copy
+    an authed admin can reveal. A DB leak alone exposes nothing without the key.
+    """
+    __tablename__ = "door_codes"
+
+    device_id = Column(String(64), primary_key=True)
+    pin_enc = Column(String(255))                    # Fernet ciphertext
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+
+class ConfirmCode(Base):
+    """The liveness-confirmation code (2nd factor typed after liveness) + its
+    enable flag, per device, so an admin can review/toggle it in the app.
+
+    Same convenience-copy model as DoorCode: encrypted PIN, device is still the
+    source of truth for the actual check. `enabled` mirrors the firmware toggle.
+    """
+    __tablename__ = "confirm_codes"
+
+    device_id = Column(String(64), primary_key=True)
+    pin_enc = Column(String(255))                    # Fernet ciphertext (nullable until set)
+    enabled = Column(Boolean, default=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
 
 
 class User(Base):
