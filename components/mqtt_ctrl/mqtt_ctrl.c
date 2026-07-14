@@ -18,6 +18,7 @@
 #include "temp_pin.h"
 #include "door_pin.h"
 #include "confirm_pin.h"
+#include "mode_ctrl.h"
 #include "face_ctrl.h"
 #include "cloud_verify_ctrl.h"
 
@@ -272,6 +273,17 @@ static void handle_command(const char *json, int len)
         // Arm the camera to scan a WiFi QR from the app. Main loop takes it.
         wifi_scan_request_set();
         publish_ack(nonce, "ok", "scanning");
+    } else if (strcmp(type, "set_mode") == 0) {
+        // Runtime operating mode 1=Local / 2=Hybrid / 3=Cloud-Assisted.
+        const cJSON *jm = cJSON_GetObjectItem(jargs, "mode");
+        if (!cJSON_IsNumber(jm) || jm->valueint < 1 || jm->valueint > 3
+                || !mode_ctrl_set((uint8_t) jm->valueint)) {
+            publish_ack(nonce, "error", "bad_args");
+        } else {
+            char detail[8];
+            snprintf(detail, sizeof detail, "mode_%d", jm->valueint);
+            publish_ack(nonce, "ok", detail);
+        }
     } else {
         publish_ack(nonce, "error", "unknown_type");
     }
@@ -348,6 +360,12 @@ static const char *method_str(mqtt_method_t m)
 void mqtt_ctrl_publish_event(mqtt_method_t method, int id, float score, bool granted)
 {
     if (s_client == NULL || !s_connected) {
+        return;
+    }
+    // Cloud reporting is a Mode 2+ behavior. In Mode 1 (Local) the lock still
+    // decides + acts locally but stays silent — gate every event publish here,
+    // the one choke point all callers route through, instead of at each call site.
+    if (mode_ctrl_get() < 2) {
         return;
     }
 
