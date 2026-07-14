@@ -14,6 +14,7 @@ Interactive docs are auto-generated at /docs.
 import asyncio
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -21,7 +22,7 @@ from fastapi import (FastAPI, Depends, HTTPException, Query, WebSocket,
                      WebSocketDisconnect, status)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -307,3 +308,40 @@ async def delete_user_face(user_id: int, device_id: str,
     if db.get(User, user_id) is None:
         raise HTTPException(status_code=404, detail="user not found")
     return await _dispatch_command(device_id, "delete_user", {"user_id": user_id})
+
+
+# --- Temporary guest PIN (OTP-style; lives on the device, not the DB) ---
+
+class TempPinIn(BaseModel):
+    pin: str
+    ttl_s: int
+
+    @field_validator("pin")
+    @classmethod
+    def _pin_digits(cls, v: str) -> str:
+        if not re.fullmatch(r"\d{4,6}", v):
+            raise ValueError("pin must be 4-6 digits")
+        return v
+
+    @field_validator("ttl_s")
+    @classmethod
+    def _ttl_range(cls, v: int) -> int:
+        if not (0 < v <= 86400):
+            raise ValueError("ttl_s must be 1..86400 seconds")
+        return v
+
+
+@app.post("/devices/{device_id}/temp_pin", response_model=CommandOut)
+async def set_temp_pin(device_id: str, body: TempPinIn,
+                       _sub: str = Depends(require_auth)):
+    """Arm a one-time guest PIN on the lock. It unlocks once, then dies — or
+    expires after ttl_s, whichever comes first. Not stored server-side."""
+    return await _dispatch_command(device_id, "set_temp_pin",
+                                   {"pin": body.pin, "ttl_s": body.ttl_s})
+
+
+@app.delete("/devices/{device_id}/temp_pin", response_model=CommandOut)
+async def clear_temp_pin(device_id: str, _sub: str = Depends(require_auth)):
+    """Revoke any active guest PIN on the lock (empty pin clears the slot)."""
+    return await _dispatch_command(device_id, "set_temp_pin",
+                                   {"pin": "", "ttl_s": 0})

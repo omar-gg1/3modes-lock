@@ -17,6 +17,7 @@
 #include "mqtt_ctrl.h"
 #include "cloud_verify_ctrl.h"
 #include "enroll_request.h"
+#include "temp_pin.h"
 #include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
@@ -360,6 +361,10 @@ void app_main(void) {
                 } else {
                     if (strcmp(pin_buf, UNLOCK_PIN) == 0) {
                         lock_ctrl_trigger_unlock("PIN code");
+                        mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, true);
+                    } else if (temp_pin_try(pin_buf)) {
+                        // OTP-style guest PIN — consumed on this single use.
+                        lock_ctrl_trigger_unlock("temp PIN");
                         mqtt_ctrl_publish_event(MQTT_METHOD_PIN, -1, NAN, true);
                     } else {
                         ESP_LOGW(TAG, "Wrong unlock PIN");

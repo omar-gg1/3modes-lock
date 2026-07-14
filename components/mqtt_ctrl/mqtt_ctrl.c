@@ -15,6 +15,7 @@
 #include "cmd_verify.h"
 #include "lock_ctrl.h"
 #include "enroll_request.h"
+#include "temp_pin.h"
 #include "face_ctrl.h"
 #include "cloud_verify_ctrl.h"
 
@@ -231,6 +232,15 @@ static void handle_command(const char *json, int len)
             enroll_request_set((int) juid->valuedouble, samples);
             publish_ack(nonce, "ok", "arming");
         }
+    } else if (strcmp(type, "set_temp_pin") == 0) {
+        // OTP-style guest PIN. Empty pin => revoke. Stored in RAM; accepted on
+        // the keypad once (temp_pin_try) until it expires. See [[temp_pin]].
+        const cJSON *jpin = cJSON_GetObjectItem(jargs, "pin");
+        const cJSON *jttl = cJSON_GetObjectItem(jargs, "ttl_s");
+        const char *pin = cJSON_IsString(jpin) ? jpin->valuestring : "";
+        int ttl_s = cJSON_IsNumber(jttl) ? (int) jttl->valuedouble : 0;
+        temp_pin_set(pin, ttl_s);
+        publish_ack(nonce, "ok", pin[0] == '\0' ? "cleared" : "armed");
     } else {
         publish_ack(nonce, "error", "unknown_type");
     }
