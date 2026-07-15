@@ -31,7 +31,8 @@ from . import mqtt_client, security, reachability, commands
 from .database import (SessionLocal, AccessEvent, User, DoorCode, ConfirmCode,
                        WifiStatus, DeviceMode, init_db, wait_for_db)
 from .schemas import (AccessEventOut, LoginIn, TokenOut, DeviceStatusOut,
-                      CommandOut, UserIn, UserUpdate, UserOut, ModeIn, ModeOut)
+                      CommandOut, UserIn, UserUpdate, UserOut, ModeIn, ModeOut,
+                      BlePassOut)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -533,3 +534,18 @@ def get_mode(device_id: str, db: Session = Depends(get_db),
              _sub: str = Depends(require_auth)):
     """Last-acked operating mode; defaults to 3 (firmware default) if never set."""
     return _mode_out(db, device_id)
+
+
+# --- BLE proximity unlock: mint a signed pass the app replays over Bluetooth ---
+
+BLE_PASS_TTL_S = 120  # survives the walk to the door; nonce ring stops reuse
+
+
+@app.post("/devices/{device_id}/ble_pass", response_model=BlePassOut)
+def ble_pass(device_id: str, _sub: str = Depends(require_auth)):
+    """A pre-signed `unlock` command the app caches while online and replays over
+    BLE when near the lock — no cloud round-trip at unlock time. We only mint it;
+    we do NOT publish it or register a pending future (its ack returns over BLE).
+    The lock verifies the same HMAC/expiry/nonce as any command, so the phone
+    never holds the secret and a sniffed pass can be replayed at most once."""
+    return commands.build_command(device_id, "unlock", {}, ttl_s=BLE_PASS_TTL_S)

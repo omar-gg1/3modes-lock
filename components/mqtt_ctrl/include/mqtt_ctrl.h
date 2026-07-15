@@ -32,6 +32,7 @@ typedef enum {
     MQTT_METHOD_BUTTON,
     MQTT_METHOD_TEMP_PIN,   // OTP guest PIN consumed — distinct so the app can
                             // clear its armed slot and the log reads "Temp PIN"
+    MQTT_METHOD_BLE,        // proximity unlock over BLE (phone near the lock)
 } mqtt_method_t;
 
 /**

@@ -106,3 +106,15 @@ class ModeOut(BaseModel):
     updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class BlePassOut(BaseModel):
+    """A backend-signed `unlock` command the app replays over BLE when near the
+    lock. Same wire shape as any command; longer expiry so it survives the walk
+    to the door. Never published by the backend — delivered out-of-band over BLE."""
+    type: str
+    nonce: str
+    iat: int
+    exp: int
+    args: dict
+    sig: str

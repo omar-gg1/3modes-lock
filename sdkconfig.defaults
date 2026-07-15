@@ -54,3 +54,22 @@ CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
 # startup, writes NOTHING to flash, so the race window never opens. A door lock
 # doesn't care about the tiny recal cost.
 # CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE is not set
+
+# --- Flash size + custom partition table. These lived ONLY in the git-tracked
+# sdkconfig before, so regenerating sdkconfig from defaults reset them to the
+# 2MB / single-1MB-app board default and the 4.5MB image overflowed. Pin them
+# here so a sdkconfig regen can never drop the 6MB factory partition again.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# --- BLE proximity unlock (ble_ctrl): NimBLE host, BLE-only, coexists with WiFi.
+# NimBLE is the smaller of the two Bluetooth hosts (BLE-only, no Classic), which
+# matters given the flash budget. The S3 shares one radio between WiFi and BLE;
+# the default software coexistence handles the time-slicing.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y

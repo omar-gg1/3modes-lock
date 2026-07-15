@@ -23,6 +23,7 @@
 #include "door_pin.h"
 #include "confirm_pin.h"
 #include "mode_ctrl.h"
+#include "ble_ctrl.h"
 #include "wifi_config.h"
 
 #define ENROLLMENT_TIMEOUT_MS 10000
@@ -267,6 +268,10 @@ void app_main(void) {
         ESP_ERROR_CHECK(crypto_ctrl_init());
     }
     if (ENABLE_LOCK)   lock_ctrl_init();
+    // BLE proximity unlock: works offline (its whole point), so it is NOT gated
+    // on Wi-Fi. Needs lock_ctrl up (it triggers unlock). Reporting the BLE event
+    // over MQTT is a no-op when the network is down, same as any local action.
+    if (ENABLE_LOCK)   ble_ctrl_init();
     if (ENABLE_BUTTON) button_ctrl_init();
     if (ENABLE_KEYPAD) keypad_ctrl_init();
     if (ENABLE_CAMERA) camera_ctrl_init();

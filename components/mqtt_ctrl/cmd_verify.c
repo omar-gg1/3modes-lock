@@ -5,6 +5,7 @@
 
 #include "mbedtls/md.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 
 static const char *SELFTEST_TAG = "cmd_verify";
 
@@ -14,6 +15,10 @@ static const char *SELFTEST_TAG = "cmd_verify";
 static char s_nonce_ring[NONCE_RING][NONCE_LEN];
 static int  s_nonce_head = 0;
 static int  s_nonce_count = 0;
+// The nonce ring is now touched from two tasks — the MQTT command handler and
+// the BLE write callback (both deliver signed commands). Guard it so a BLE and
+// an MQTT command can't interleave a lookup/insert and let a replay slip past.
+static portMUX_TYPE s_nonce_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void cmd_build_signing_string(char *out, size_t out_sz,
                               const char *device_id, const char *type,
@@ -61,14 +66,19 @@ int cmd_sig_matches(const char *secret_hex, const char *signing_string,
 }
 
 bool cmd_nonce_seen_or_record(const char *nonce) {
+    portENTER_CRITICAL(&s_nonce_mux);
     for (int i = 0; i < s_nonce_count; i++) {
         int idx = (s_nonce_head - 1 - i + NONCE_RING) % NONCE_RING;
-        if (strncmp(s_nonce_ring[idx], nonce, NONCE_LEN - 1) == 0) return true;
+        if (strncmp(s_nonce_ring[idx], nonce, NONCE_LEN - 1) == 0) {
+            portEXIT_CRITICAL(&s_nonce_mux);
+            return true;
+        }
     }
     strncpy(s_nonce_ring[s_nonce_head], nonce, NONCE_LEN - 1);
     s_nonce_ring[s_nonce_head][NONCE_LEN - 1] = '\0';
     s_nonce_head = (s_nonce_head + 1) % NONCE_RING;
     if (s_nonce_count < NONCE_RING) s_nonce_count++;
+    portEXIT_CRITICAL(&s_nonce_mux);
     return false;
 }
 

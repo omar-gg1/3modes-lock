@@ -353,6 +353,7 @@ static const char *method_str(mqtt_method_t m)
     case MQTT_METHOD_PIN:      return "pin";
     case MQTT_METHOD_BUTTON:   return "button";
     case MQTT_METHOD_TEMP_PIN: return "temp_pin";
+    case MQTT_METHOD_BLE:      return "ble";
     default:                   return "unknown";
     }
 }
